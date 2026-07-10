@@ -574,8 +574,10 @@ class Microwave3D:
 
     def _initialize_bcs(self, surfaces: list[GeoSurface]) -> None:
         """Initializes the boundary conditions to set PEC as all exterior boundaries."""
+        if self._bc_initialized:
+            return
         logger.debug("Initializing boundary conditions.")
-
+        
         # These tags are all faces that actually terminate the simulation domain.
         external_tags = self.mesher.domain_boundary_face_tags
 
@@ -624,6 +626,7 @@ class Microwave3D:
             logger.info(f"Assigning SurfaceImpedance BC to {assignment}")
             self.bc.no_overwrite().SurfaceImpedance(FaceSelection(list(assignment)), material=material)
 
+        self._bc_initialized = True
     def _initialize_bc_data(self):
         """Initializes auxilliary required boundary condition information before running simulations."""
         logger.debug("Initializing boundary conditions")
