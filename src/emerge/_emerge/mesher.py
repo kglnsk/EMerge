@@ -212,6 +212,8 @@ class Mesher:
     def _get_periodic_bcs(self) -> list[Periodic]:
         if self.periodic_cell is None:
             return []
+        if not self.periodic_cell._bcs:
+            self.periodic_cell.generate_bcs()
         return self.periodic_cell._bcs
 
     def _check_ready(self) -> None:

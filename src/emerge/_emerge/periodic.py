@@ -73,6 +73,7 @@ class PeriodicCell:
         self.included_faces: Selection | None = None
         self._bcs: list[Periodic] = []
         self._ports: list[BoundaryCondition] = []
+        self._scan_u: tuple[float, float, float] = (0.0, 0.0, 1.0)
 
         self.__post_init__()
 
@@ -111,7 +112,9 @@ class PeriodicCell:
                 f2_new = f2 & self.included_faces # type: ignore
             if len(f1_new.tags)==0:
                 continue
-            bcs.append(Periodic(f1_new, f2_new, tuple(a)))
+            bc = Periodic(f1_new, f2_new, tuple(a))
+            bc.ux, bc.uy, bc.uz = self._scan_u
+            bcs.append(bc)
         self._bcs = bcs
         return bcs
     
@@ -145,6 +148,7 @@ class PeriodicCell:
         ux = np.sin(theta)*np.cos(phi)
         uy = np.sin(theta)*np.sin(phi)
         uz = np.cos(theta)
+        self._scan_u = (ux, uy, uz)
         for bc in self._bcs:
             bc.ux = ux
             bc.uy = uy

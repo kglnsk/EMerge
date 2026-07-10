@@ -579,18 +579,20 @@ class Microwave3D:
         # These tags are all faces that actually terminate the simulation domain.
         external_tags = self.mesher.domain_boundary_face_tags
 
+        # Assign the periodic boundary conditions first so that the cell walls are
+        # not swallowed by the blanket exterior PEC assignment below.
+        if self.mesher.periodic_cell is not None:
+            if not self.mesher.periodic_cell._bcs:
+                self.mesher.periodic_cell.generate_bcs()
+            for bc in self.mesher.periodic_cell.bcs:
+                self.bc.no_overwrite().assign(bc)
+
         # Assign PEC to all unassigned external boundaries.
         external_tags = [tag for tag in external_tags if tag not in self.bc.assigned(2)]
 
         if len(external_tags) > 0:
             logger.info(f"Adding PEC boundary condition with tags {external_tags}.")
             self.bc.no_overwrite().PEC(FaceSelection(external_tags))
-
-        
-        if self.mesher.periodic_cell is not None:
-            self.mesher.periodic_cell.generate_bcs()
-            for bc in self.mesher.periodic_cell.bcs:
-                self.bc.no_overwrite().assign(bc)
 
         # Assign SurfaceImpedance to all conducting volume_boundaries
         material_map = defaultdict(set)
