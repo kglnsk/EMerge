@@ -1245,6 +1245,13 @@ class SolverPardiso(Solver):
     ) -> tuple[np.ndarray, SolveReport]:
 
         logger.info(f"{_pfx(self.pre, id)} Calling Pardiso Solver")
+        # The MKL PARDISO interface reads the raw index arrays as CSR with
+        # sorted row entries. The assembler supplies unsorted CSC; passing that
+        # through factorizes the transpose (wrong results for matrices with
+        # asymmetric values, e.g. oblique-incidence Floquet problems) and the
+        # unsorted indices can crash MKL.
+        A = sparse.csr_matrix(A)
+        A.sort_indices()
         if self.fact_symb is False:
             logger.trace(f"{_pfx(self.pre, id)} Executing symbollic factorization.")
             self.solver.symbolic(A)

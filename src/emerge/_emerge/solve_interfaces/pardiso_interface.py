@@ -418,10 +418,17 @@ class PardisoInterface:
             tuple[np.ndarray, int]: The solution vector x and error code.
         """
 
+        # MKL PARDISO reads the index arrays as CSR with sorted row entries;
+        # any other format silently factorizes the wrong matrix or crashes.
+        if A.format != "csr":
+            A = sparse.csr_matrix(A)
+        if not A.has_sorted_indices:
+            A.sort_indices()
+
         # Declare the empty vector
         x = np.zeros_like(b)
         error = ctypes.c_int32(0)
-        
+
         # Up the pointers as PARDISO uses [1,...] indexing
         A_index_pointers = A.indptr + 1
         A_indices = A.indices + 1

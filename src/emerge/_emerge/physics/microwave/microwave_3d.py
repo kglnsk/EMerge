@@ -2245,6 +2245,17 @@ class Microwave3D:
                 self.mesh.nodes, self.mesh.tris[:, tris], portfE, portfH, inward_normal
             )
 
+            if abs(power) < 1e-20:
+                # Below-cutoff port modes transport no real power; leave them
+                # unnormalized instead of dividing by zero so multimode ports
+                # with evanescent members can still be solved.
+                logger.warning(
+                    f"Port {active_port} mode {mode_nr} carries no power "
+                    f"(below cutoff?); skipping normalization."
+                )
+                p_constants[smat_index] = 1.0
+                continue
+
             p_constants[smat_index] = 1 / (abs(power)) ** 0.5
             logger.debug(f"Port {active_port} power = {power:.4f} [W]")
         return p_constants
