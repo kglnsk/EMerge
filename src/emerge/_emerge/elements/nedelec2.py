@@ -26,7 +26,6 @@ from ..compiled import MATHLIB
 from .dofsets import DoFSet
 
 ############### Nedelec2 Class
-USE_NUMBA = False
 
 
 class DoFSplitException(Exception):
@@ -91,25 +90,137 @@ class Nedelec2(FEMBasis, Saveable):
         self.tri_to_split: list[int] = []
 
         self._dof_mapping: dict[int, int] = dict()
-        self._tet_to_field_orig: np.ndaray = None
         self._partitioned: bool = False
+        self._split_tris: list[int] = []
         self.diagnose()
-
-        rows, cols = self.empty_tri_rowcol()
-        self._rows = rows
-        self._cols = cols
         
+    def compute_global_dofcodes(self) -> np.ndarray:
+        """Expand `field.dofcodes3d` (fixed-length, one entry per local basis-
+        function slot of a single tet, identical for every tet of this element
+        order) into a length-`field.n_field` array aligned with the row/column
+        order of the assembled E/B matrices.
+
+        A given global DOF is referenced by every tet that shares the mesh
+        edge/face it lives on; those references must all agree on its dofcode
+        (edge-vs-face + which basis-function definition), since that's a
+        property of the abstract basis function, not of any one tet. This is
+        checked rather than assumed -- a mismatch means something about the
+        element setup violates that assumption and should be looked at, not
+        silently averaged over.
+
+        Args:
+            field: a Nedelec2 field object (anything exposing `tet_to_field`,
+                `dofcodes3d`, and `n_field`).
+
+        Returns:
+            np.ndarray, shape (field.n_field,), int64 dofcode per global DOF.
+        """
+        field = self
+        tet_to_field = field.tet_to_field  # (ndof_local, ntets)
+        dofcodes3d = np.asarray(field.dofcodes3d)  # (ndof_local,)
+
+        global_codes = np.full(field.n_field, -1, dtype=np.int64)
+
+        for idof in range(dofcodes3d.shape[0]):
+            gids = tet_to_field[idof, :]
+            code = int(dofcodes3d[idof])
+
+            existing = global_codes[gids]
+            conflict = (existing != -1) & (existing != code)
+            if np.any(conflict):
+                bad = int(gids[conflict][0])
+                raise ValueError(
+                    f"Inconsistent dofcode for global DOF {bad}: "
+                    f"already tagged {global_codes[bad]}, local slot {idof} says {code}. "
+                    f"This means a DOF is being reached by basis-function definitions "
+                    f"that disagree -- check element-order consistency across the mesh."
+                )
+            global_codes[gids] = code
+
+        unset = np.flatnonzero(global_codes == -1)
+        if unset.size:
+            raise ValueError(
+                f"{unset.size} of {field.n_field} global DOFs were never referenced "
+                f"by any tet (e.g. dof {int(unset[0])}) -- dofcode undefined for them."
+            )
+
+        return global_codes
+
+    @staticmethod
+    def _parse_dofcode_np(dofcodes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Pure-numpy reimplementation of emr.ccbf.parse_dofcode (emr/src/compiled/ccbf.rs) -- kept
+        inline (rather than imported) so this file has no relative-import
+        dependency on wherever it ends up living inside EMerge.
+
+        Returns (typearray, indexarray): typearray 0=edge/1=face, indexarray =
+        the *local* edge index (0-5) or local face index (0-3) within a tet that
+        this local dof-template slot corresponds to.
+        """
+        dofcodes = np.asarray(dofcodes)
+        idofcode = dofcodes & 0b00111111
+        is_edge = (dofcodes & 0b11000000) == 64
+        typearray = np.where(is_edge, 0, 1)
+
+        indexarray = np.empty_like(dofcodes, dtype=np.int64)
+        counters: dict[tuple[int, bool], int] = {}
+        for i in range(dofcodes.shape[0]):
+            key = (int(idofcode[i]), bool(is_edge[i]))
+            indexarray[i] = counters.get(key, 0)
+            counters[key] = counters.get(key, 0) + 1
+        return typearray, indexarray
+
+
+    def compute_global_dof_coords(self) -> np.ndarray:
+        """Representative world-space coordinate per global DOF: the midpoint of
+        its mesh edge (edge-type DOFs) or centroid of its mesh face (face-type
+        DOFs). Deliberately doesn't distinguish basis-function definition on the
+        same edge/face (e.g. curl-type vs. grad-type both live at the same
+        midpoint) -- that distinction is `dof_types`' job, not this one's.
+
+        Returns:
+            np.ndarray, shape (3, field.n_field), same axis convention as
+            `field.mesh.nodes`.
+        """
+        field = self
+        mesh = field.mesh
+        nodes = mesh.nodes            # (3, n_nodes)
+        edges = mesh.edges            # (2, n_edges) -- global node ids per edge
+        tris = mesh.tris              # (3, n_tris)  -- global node ids per face
+        tet_to_edge = mesh.tet_to_edge  # (6, ntets)
+        tet_to_tri = mesh.tet_to_tri    # (4, ntets)
+        tet_to_field = field.tet_to_field  # (ndof_local, ntets)
+        dofcodes3d = np.asarray(field.dofcodes3d)
+
+        typearray, indexarray = self._parse_dofcode_np(dofcodes3d)
+
+        edge_coords = (nodes[:, edges[0, :]] + nodes[:, edges[1, :]]) / 2.0
+        tri_coords = (nodes[:, tris[0, :]] + nodes[:, tris[1, :]] + nodes[:, tris[2, :]]) / 3.0
+
+        dof_coords = np.full((3, field.n_field), np.nan)
+
+        for idof in range(dofcodes3d.shape[0]):
+            gids = tet_to_field[idof, :]
+            if typearray[idof] == 0:
+                eids = tet_to_edge[indexarray[idof], :]
+                dof_coords[:, gids] = edge_coords[:, eids]
+            else:
+                tids = tet_to_tri[indexarray[idof], :]
+                dof_coords[:, gids] = tri_coords[:, tids]
+
+        unset = np.flatnonzero(np.isnan(dof_coords[0, :]))
+        if unset.size:
+            raise ValueError(
+                f"{unset.size} of {field.n_field} global DOFs got no coordinate "
+                f"(e.g. dof {int(unset[0])})."
+            )
+
+        return dof_coords
+
 
     def diagnose(self):
         visited_field = np.zeros((self.n_field,), dtype=np.bool)
-        for i in range(self.mesh.n_tets):
-            visited_field[self.tet_to_field[:, i]] = True
+        visited_field[self.tet_to_field] = True
         assert np.all(visited_field)
-
-    def get_tet_to_field(self) -> np.ndarray:
-        if self._tet_to_field_orig is not None:
-            return self._tet_to_field_orig
-        return self.tet_to_field
 
     def partition_dof(self, list_tags: list[list[int]]) -> None:
         """Partition_DOF splits the degrees of freedom for an input list of face tags."""
@@ -121,7 +232,6 @@ class Nedelec2(FEMBasis, Saveable):
         if self.tri_to_field_os is None:
             self.tri_to_field_os = self.tri_to_field.copy()
             self.edge_to_field_os = self.edge_to_field.copy()
-            self._tet_to_field_orig = self.tet_to_field.copy()
 
         tags: list[int] = []
         for sublist in list_tags:
@@ -139,6 +249,8 @@ class Nedelec2(FEMBasis, Saveable):
 
         split_edges = sorted(list(set(split_edges)))
         split_tris = sorted(list(set(split_tris)))
+        split_tets = self._copied_side_tets(split_tets, split_tris, split_edges)
+        self._split_tris = split_tris
 
         NF = self.n_field
         NE_SPLIT = len(split_edges)
@@ -169,6 +281,58 @@ class Nedelec2(FEMBasis, Saveable):
 
 
         self._partitioned = True
+
+    # [Written by Claude]
+    def _copied_side_tets(self, face_tets: list[int], split_tris: list[int], split_edges: list[int]) -> list[int]:
+        """All tets on the copied side of the sheets that contain a split edge.
+
+        face_tets are the tets on the copied side that share a face with a sheet triangle. The tets that
+        only touch the sheet through an edge must use the copied DoFs of that edge as well, otherwise the
+        two sides stay connected through them. Around every split edge the ring of tets is cut in two by the
+        two sheet triangles on that edge; the half that holds the face tets is the copied side.
+
+        Args:
+            face_tets (list[int]): The tets on the copied side that share a face with the sheet
+            split_tris (list[int]): The sheet triangles
+            split_edges (list[int]): The split (interior) sheet edges
+
+        Returns:
+            list[int]: The sorted tets on the copied side that contain a split edge or a sheet triangle
+        """
+        mesh = self.mesh
+        sheet = set(split_tris)
+        copied = set(face_tets)
+
+        # Tets around every split edge
+        hit = np.flatnonzero(np.isin(mesh.tet_to_edge, split_edges))
+        rows, cols = np.unravel_index(hit, mesh.tet_to_edge.shape)
+        edge_tets: dict[int, list[int]] = {}
+        for ie, itet in zip(mesh.tet_to_edge[rows, cols].tolist(), cols.tolist()):
+            edge_tets.setdefault(ie, []).append(itet)
+
+        result = set(face_tets)
+        for ie in split_edges:
+            ring = edge_tets.get(ie, [])
+            # Neighbours in the ring share a triangle that contains the edge (and is not a sheet triangle)
+            face_tet: dict[int, list[int]] = {}
+            for itet in ring:
+                for itri in mesh.tet_to_tri[:, itet].tolist():
+                    if itri not in sheet and ie in mesh.tri_to_edge[:, itri]:
+                        face_tet.setdefault(itri, []).append(itet)
+            neighbours: dict[int, list[int]] = {itet: [] for itet in ring}
+            for pair in face_tet.values():
+                if len(pair) == 2:
+                    neighbours[pair[0]].append(pair[1])
+                    neighbours[pair[1]].append(pair[0])
+            stack = [itet for itet in ring if itet in copied]
+            seen = set(stack)
+            while stack:
+                for nb in neighbours[stack.pop()]:
+                    if nb not in seen:
+                        seen.add(nb)
+                        stack.append(nb)
+            result |= seen
+        return sorted(result)
 
     def _partition_dof_face(self, tag: int) -> None:
         """Splits DOFs on a specific face tag between two volumes.
@@ -224,12 +388,11 @@ class Nedelec2(FEMBasis, Saveable):
             tet1 = self.mesh.tri_to_tet[0, itri]
             tet2 = self.mesh.tri_to_tet[1, itri]
 
-            tri_c = self.mesh.tri_centers[:, itri]
-            tet_c = self.mesh.centers[:, tet2]
-            vec = tet_c - tri_c
-            vec = vec / (np.linalg.norm(vec) + 1e-13)
+            # The copied side is the side the face normal points to. get_normal has an arbitrary sign,
+            # so orient it with the face normal first, then check on which side tet2 lies.
             trinorm = self.mesh.get_normal(itri)
-            normdot = np.sum(trinorm * normal)
+            trinorm = trinorm * np.sign(np.sum(trinorm * normal) or 1.0)
+            vec = self.mesh.centers[:, tet2] - self.mesh.tri_centers[:, itri]
 
             e1, e2, e3 = self.mesh.tri_to_edge[:, itri]
             for ie in (e1, e2, e3):
@@ -237,11 +400,7 @@ class Nedelec2(FEMBasis, Saveable):
                     split_edges.append(ie)
             split_tris.append(itri)
 
-            pick = tet1
-            if normdot > 0:
-                pick = tet2
-
-            split_tets.append(pick)
+            split_tets.append(tet2 if np.sum(vec * trinorm) > 0 else tet1)
 
         return split_tets, split_tris, split_edges
 
@@ -335,6 +494,6 @@ class Nedelec2(FEMBasis, Saveable):
 
         if not usenan and n_zeros > 0:
             logger.debug(f"Converted {n_zeros} to zeros.")
-            vals[vals == -1] == 0
+            vals[vals == -1] = 0
 
         return vals

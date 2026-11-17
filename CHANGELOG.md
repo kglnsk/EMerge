@@ -1,0 +1,818 @@
+# Changelog
+
+## 3.0.8 — changes since 3.0.7
+
+### New features
+
+- **SPARTA is installed with EMerge** on macOS, Windows (x86-64) and Linux (x86-64 and ARM64), the platforms
+  with SPARTA wheels. On other platforms it is skipped and EMerge uses its other solvers. EMerge also runs when
+  an installed SPARTA does not load: it warns and continues without it. To run without SPARTA, uninstall it
+  (`pip uninstall sparta-solver`) or set the environment variable `EMERGE_DISABLE_SPARTA=1`.
+- **`SolverSparta.config(**settings)`** sets SPARTA's own settings by name, e.g.
+  `model.set_solver(em.solvers.Sparta).config(supernodal=True)`. Its docstring describes every setting of
+  SPARTA 0.3.5. Settings that EMerge manages itself (`force_cpu`, `hybrid`, `mtype`, `threads`) are refused with
+  what to use instead, and a setting the installed SPARTA does not know raises an error that names its version.
+
+### Changed behaviour
+
+- **SPARTA is the first choice for sweeps.** Before, PARDISO was used where it is available (x86) and SPARTA
+  otherwise; now SPARTA comes first, then PARDISO, then Apple Accelerate (AASDS).
+- **Less memory, faster assembly.** On a 177k tetrahedra model (1.2M degrees of freedom), the memory still in
+  use after a sweep went from 7.7 to 3.4 GB and the peak from 21.5 to 17.6 GB (6 frequencies,
+  `frequency_groups=1`); the volume assembly is about 50 % faster. Most of it came from the COO to CSC mapping of
+  the system matrix, which now uses 32-bit indices, frees its buffers after use and is dropped once the volume
+  matrices are cached. The peak is now set by the factorization of the solver.
+- **`Mesh3D` stores less.** The dictionaries `inv_edges`, `inv_tris`, `inv_tets` and the GMSH tag mappings
+  (`n_i2t`, `n_t2i`, `tet_i2t`, `tet_t2i`, `tri_i2t`, `tri_t2i`, `edge_i2t`, `edge_t2i`) are removed, as are the
+  unused `edge_to_tri` and `node_to_edge`. `ftag_to_node` is now derived from `ftag_to_tri`. `get_edge`,
+  `get_tri` and `get_tet` still work. Result files of earlier versions still load.
+- **One procedure for the port modes of `ModalPort` and `WavePort`.** Both fix their modes at one frequency (a
+  `ModalPort` at its first modal analysis, a `WavePort` at the highest frequency) and then scale them to the
+  other frequencies (a homogeneous port face) or follow them by solving, matched by their field and with a
+  continuous phase. Before, a `ModalPort` on an inhomogeneous face re-sorted its modes by β at every frequency.
+  The S-parameters of the tested ports did not change. Related changes:
+  - A `ModalPort` keeps `number_of_modes` modes after a sweep (before, every mode its analyses had solved).
+  - Below cutoff a `ModalPort` no longer solves at the frequencies where its mode is predicted to be evanescent
+    (it kept the mode of the nearest frequency there anyway).
+  - `modal_analysis()` returns the number of modes it found, and warns instead of raising an error when no mode
+    propagates; the sweep still stops with an error if a `ModalPort` has fewer modes than `number_of_modes`.
+
+### Bug fixes
+
+- **Port boundary terms for TM modes and ports in magnetic material** (#106). A `ModalPort` used the Robin
+  coefficient γ = jβ for every mode, which is exact for TE and TEM modes only; a TM mode needs γ = jk²/β. Both
+  `ModalPort` and `WavePort` also left out the 1/μr of the port boundary term. An empty guide with PMC side walls
+  (a TM mode) reflected |S11| = 0.18 and a guide filled with μr = 4 reflected |S11| = 0.86; both are now below
+  0.001. The coefficient is now computed from the mode, so it is jβ for TE/TEM modes and jk²/β for TM modes.
+- **`align_modes()` did not set the polarization of degenerate modes**, such as TE10/TE01 of a square guide or
+  the TE11 pair of a round guide. The eigen solver returns any combination of such a pair, and the alignment only
+  picked from it: in a square guide each port mode was at about 45° to the axes, so a y-polarized wave was split
+  over both modes of the other port. A degenerate TE or TM pair is now rotated onto the alignment vectors.
+- **`WavePort` with `align_modes()` failed** with "'numpy.ndarray' object has no attribute 'x'".
+- **The sign of the modes from the TE/TM split** of a degenerate group (e.g. TE11/TM11 of a rectangular guide)
+  was arbitrary; they now get the canonical sign like the other modes.
+- **`solve_cnosdd`** used outdated signatures of the Robin and second order ABC assembly.
+
+## 3.0.7 — changes since 3.0.6
+
+### Bug fixes
+
+- **Slow port mode analysis in 3.0.6** (#105). Since the port mode analysis uses the basis functions of the
+  simulation (#98), the sparse LU factorization of its shift-invert step could lose its fill-reducing ordering
+  through partial pivoting. On a microstrip port the factors grew from 1.2 M to 132 M entries (199 s instead of
+  0.17 s). The matrix is symmetric, so SuperLU now runs in symmetric mode with diagonal pivoting; the accuracy
+  is unchanged.
+- **`WavePort.get_beta` between solved frequencies** (#102). At a frequency where the port modes were not
+  solved, β of the nearest solved frequency was returned unchanged, so `is_propagating()` missed a cutoff in
+  between (WR-90 TE20 solved at 20 and 30 GHz read as propagating at 12 GHz). β is now extrapolated like
+  `ModalPort.get_beta`. The S-parameters of a sweep did not change: every sweep frequency has its own modes.
+
+## 3.0.6 — changes since 3.0.5
+
+### Changed behaviour
+
+- **The port mode analysis uses the basis functions of the simulation** (`set_basis_space`). Before, the modes
+  of every `ModalPort` and `WavePort` were always computed with the second-order mixed set, whatever the 3D
+  basis. With `element_order=1, complete=False` (Whitney edges only) the port modes are now first order too,
+  which is less accurate (β about 15 % off on a coarse TEM line) but consistent with the volume: power is
+  conserved.
+
+### Bug fixes
+
+- **Ports lost power with the second-order complete basis** (#98). On a lossless line |S11|² + |S21|² was about
+  0.88 with a `ModalPort`, and a `WavePort` reflected nearly everything. The complete sets add cubic gradient
+  DoFs (edge DoF 3 and face DoF 6) that the port mode cannot contain. They carried a field on the port face that
+  the port absorbed but the S-parameters did not count. These DoFs are now pinned to zero on the faces of
+  `ModalPort`s and `WavePort`s and in their mode analysis; the volume keeps the complete basis. On the TEM test
+  line the S21 phase error stays about 3.5× smaller than with the mixed basis.
+- **Port mode search in overmoded guides** (#99). The search target used the minimum of εr and μr over the
+  whole material tensor, which is 0 for an isotropic material (the off-diagonal entries), so the search started
+  at k0/√2. In WR-90 at 40 GHz a two-mode `WavePort` found two higher-order modes instead of TE10 and TE20. The
+  minimum is now taken over the diagonal.
+
+## 3.0.5 — changes since 3.0.4
+
+### New features
+
+- **Corvid with thin conductors**: Corvid now also runs on models with `ThinConductor` sheets (e.g. copper
+  traces and patches). Before, the split DoFs of a sheet had no mesh data and the solve fell back to a direct
+  solver. The sheet is now described as a cut through the mesh, with copied vertices, edges and triangles.
+- **Corvid 0.5.0 support**: one Corvid solver is kept across the frequencies of a sweep, so nearby
+  frequencies keep or refactor the factorization in place and start from earlier solutions.
+  `set_nthreads()` sets Corvid's thread count (Corvid 0.4.2 and later). The default order is now 3.
+
+### Changed behaviour
+
+- **`model.set_solver(em.solvers.Corvid)`** now also switches the simulation to the iterative method. Before,
+  `model.mw.set_method('iterative')` was needed as well; without it the mesh data Corvid needs was never
+  assembled and the solve fell back to a direct solver with a warning about periodic boundaries or thin
+  conductors.
+
+### Removed
+
+- **`GeoSurface.assign_thickness()`**: give a surface its thickness with the `FiniteThickness` attribute
+  (`surf.properties += em.FiniteThickness(t)`). `SurfaceImpedance` and `ThinConductor` no longer read a
+  thickness stored on the surface.
+
+### Bug fixes
+
+- **`adaptive_mesh_refinement` ignored `set_method('iterative')`**: the refinement passes always assembled and
+  solved as direct, so Corvid fell back to a direct solver. They now follow `set_method` like `run_sweep`.
+
+## 3.0.4 — changes since 3.0.3
+
+### New features
+
+- **`em.macro.CoaxAssy`**: a coaxial line (pin, dielectric and shield) along the z-axis of a coordinate system,
+  with `rout` or `Z0` given. Each end is `'none'` (flush), `'pin'` (the pin sticks out `pin_length`, e.g. as a
+  probe) or `'port'` (a wave port on the end face of the dielectric, closed behind by a void and the shield).
+  The constructor checks that the arguments fit the chosen ends, e.g. a `pin_length` for a pin end and a port
+  number for a port end.
+- **`Axis.construct_cs(x, y, z)`** takes the origin as three coordinates, e.g.
+  `em.YAX.construct_cs(a/4, 0, L/2)`. `construct_cs((x, y, z))` and `construct_cs(origin=(x, y, z))` still work.
+
+### Changed behaviour
+
+- **ModalPorts work below the cutoff of their mode.** A sweep point slightly below the band of a waveguide no
+  longer stops the simulation with "ModalPort could find no modes". Below cutoff the mode does not propagate but
+  decays, β = -jα. A ModalPort normalizes its mode to 1 W, which a decaying mode cannot carry, so it now keeps
+  the shape of the mode at the nearest frequency where it propagates and only takes the decaying β there. The
+  excitation, absorption and S-parameters of that frequency all use that mode. If no frequency has a propagating
+  mode yet, the modal analysis is repeated at 1.5, 2.25, ... (at most 25.6) times the frequency, with a warning.
+  In a WR-90 guide, S21 below cutoff now follows exp(-αL) (−30.9 dB at 5 GHz over 40 mm), also with a lossy
+  filling. A ModalPort that finds some, but fewer than `number_of_modes`, propagating modes still reports an
+  error.
+
+### Bug fixes
+
+- **Below cutoff a port could absorb a growing instead of a decaying mode.** β came from `np.sqrt` of a
+  negative β², and which of the two roots (+jα or −jα) it returned depended on the sign of a zero imaginary part,
+  which differed between the ports of one guide. `ModalPort.get_beta` now always takes β = −jα.
+  `RectangularWaveguide.get_beta` returned `nan` below cutoff; it now also gives β = −jα.
+- **Gerber import: "Could not create line"** on some layouts with regions that contain cut-ins (keyholes). The
+  de-keyholed polygons can contain points 0.1 µm apart, which OCC merges into one point. Points closer than
+  0.5 µm to the previous one are now dropped.
+
+## 3.0.3 — changes since 3.0.2
+
+### Bug fixes
+
+- **A WavePort whose face cuts a metal conductor failed with SPARTA**: "front N failed at column 1: zero column
+  (rank deficient)". This happened on every planar WavePort with copper (or another surface impedance conductor)
+  as ground or trace, because the port face runs through them. The DoFs of the port face inside the copper were
+  freed again with the port, but no assembled tetrahedron touches them, and the WavePort term is zero inside
+  the metal, so their matrix columns were exactly zero. Pardiso and AASDS solved the singular system anyway,
+  SPARTA stopped. DoFs that only removed conductor tetrahedra touch now always stay PEC. The S-parameters do not
+  change. ModalPorts were not affected (their Robin term kept the matrix regular), nor were PEC metals.
+
+## 3.0.2 — changes since 3.0.1
+
+### New features
+
+- **`target_neff` for ModalPorts.** `ModalPort(..., target_neff=...)` and `pcb.modal_port(..., target_neff=...)`
+  set the effective index β/k0 of the wanted mode. The first modal analysis searches around it, and the modes are
+  ordered by their distance to it, so mode 1 is the mode closest to `target_neff`. At the following frequencies
+  the mode is followed from the previous one. Use it when the default search finds another mode first, e.g. a box
+  mode of a large mm-wave port instead of the microstrip or CPWG mode. Without it the search is unchanged.
+- **`em.Simulation(..., reset_settings=True)`** resets `sim.settings` to their defaults. The settings are shared
+  by every Simulation in the process, so changes made for an earlier Simulation otherwise carry over.
+  `Settings.reset_defaults()` does the same.
+- **Debug log of the conducting domains.** At the debug level the assembler lists every conducting or void
+  domain and how it is treated: PEC volume, surface impedance (interior removed), lossy volume or void.
+
+### Bug fixes
+
+- **`ThinConductor` was twice as conductive as a film of the same thickness** (#95). Both sides of the sheet
+  carried the impedance Zs·coth(γt) of one face of the slab, so at a thickness below a few skin depths the sheet
+  resistance came out half the expected value. Each side now carries Zs·coth(γt/2): 2/(σt) per side at low
+  frequency (1/(σt) together) and Zs per side for a thick conductor. PCB traces with a finite thickness use
+  this condition too; at many skin depths (e.g. 35 µm copper above about 100 MHz) nothing changes.
+- **Volume conductors above `mw_2dbc_peclim` were made PEC** (#94), even with `mw_3d_peclim` and
+  `mw_3d_surfimplim` raised above their conductivity. The 3D assembler now only makes volumes above
+  `mw_3d_peclim` PEC; `mw_2dbc_peclim` only applies to 2D surfaces.
+- **`ModalPort(modetype='TEM')` dropped quasi-TEM modes** that `settings.qtem_limit` classifies as TE or TM,
+  e.g. a dispersive microstrip mode at a high frequency. A ModalPort forced to TEM now treats its modes as
+  (quasi-)TEM, so they get a characteristic impedance and their sign from the voltage. `pcb.modal_port(...,
+  mode_type='TEM')` does the same. A `WavePort` with `modetype` still only accepts modes of that type.
+- **Sign of the voltage path between the port conductors:**
+  - `set_terminals()` was ignored when the port face has exactly two conductors. It is now always used.
+    With only one terminal given, the other one is the closest other conductor.
+  - A PCB port (`pcb.modal_port`) takes its trace as the positive terminal and the closest other conductor
+    as the negative one, also with more than two conductors on the port face.
+  - Without terminals, the positive conductor of a two-conductor port is the one with the shortest boundary
+    (the signal or inner conductor), as before.
+  - A conductor is only matched to a terminal by the objects that touch that conductor alone, not by objects
+    such as the port face that touch all of them.
+  - `ModalPort.reset()` no longer clears the terminals.
+
+## 3.0.1 — changes since 3.0.0
+
+### Breaking API changes
+
+- **`ModalPort(mixed_materials=...)` is removed.** It no longer changed how often the port modes are solved.
+  Delete the argument; the modes are now solved as few times as possible (see below). To solve the modes of an
+  inhomogeneous port only once, use `assume_homogeneous=True`.
+
+### New features
+
+- **`assume_homogeneous` for ports.** `ModalPort(..., assume_homogeneous=True)`,
+  `WavePort(..., assume_homogeneous=True)`, `pcb.modal_port(..., assume_homogeneous=True)` or
+  `port.assume_homogeneous()` treat the port face as homogeneous without checking its materials. The modes are
+  solved once and scaled to the other frequencies, with a constant effective permittivity for quasi-TEM modes.
+  Use it for, for example, microstrip ports at a low frequency × substrate thickness, where the dispersion of the
+  line is small.
+- **Waveguide assemblies (`em.wg`).** `WGRect` and E- and H-plane bends with rounded (`WGETurnRound`,
+  `WGHTurnRound`) or mitered (`WGETurnMiter`, `WGHTurnMiter`) corners at any angle from -90 to 90 degrees, with
+  an optional inner corner radius, straight lead sections and wall geometry (`WGConfig(model_walls=True)`).
+  Components are connected with `.place()` on their `front`/`back` anchors.
+- **`GeoObject.face_from_anchor(anchor)`** selects the faces in the plane of an anchor. After
+  `commit_geometry()` it works without GMSH, from the cached boundary.
+
+### Bug fixes
+
+- **ModalPort modes of homogeneous waveguides** were solved again at every frequency. Like a `WavePort`, a
+  homogeneous, lossless and non-dispersive port face is now solved once and its modes are scaled analytically to
+  the other frequencies (TE: β² = β_ref² + εr·μr (k0² − k0_ref²), TM: the transverse field also scales with β,
+  TEM: β ∝ k0) and normalized again. `ModalPort` and `WavePort` share this rule. A rectangular waveguide port is
+  now one modal analysis instead of one per frequency.
+- **PCB units:** `lumped_port_pts`, the π-network plates of `lumped_element_from_sp`, `RouteElement.pnt` and the
+  mesh size of lumped elements mixed PCB units and meters, which placed or sized them wrongly in models that
+  do not use meters.
+- **Touchstone:** the 2-port branch of `z_series` returned the wrong data.
+- **Embedding external components** (`embed_external_component`):
+  - the Touchstone data is renormalized from its reference impedance to the Z0 of each port it connects to;
+  - parameter sweeps (S-parameters of shape (..., F, N, N)) are supported;
+  - embedding on a field no longer writes NaN into the S-parameters of the scalar data;
+  - `TouchstoneData.interp_S` raises a clear error when the file does not cover the simulated frequencies.
+
+### Documentation and installation
+
+- README: SPARTA is the recommended solver (fastest on the CPU, and GPU support) and is installed from its latest
+  release; threads with `em.set_threads()` and `emerge_config`; GPU selection with `model.set_device()`;
+  UMFPACK moved to legacy; the dependency list matches the package and says pip installs it automatically.
+- The SPARTA install hints in EMerge point to the latest SPARTA release.
+- The release workflow builds the macOS wheel on `macos-latest` (the `macos-14` runner image was retired).
+
+---
+
+## 3.0.0 — changes since 2.8.9
+
+1. [New features](#1-new-features): what you can do now that you couldn't before
+2. [Breaking API changes](#2-breaking-api-changes): changes that can break existing scripts, plus
+   a migration checklist
+3. [Bug fixes, accuracy and performance](#3-bug-fixes-accuracy-and-performance)
+4. [Internal changes](#4-internal-changes): changes in how things are handled that most users
+   won't notice
+
+---
+
+## 1. New features
+
+### Meshing and adaptivity
+
+- **New adaptive mesh refinement (AURA).** `Simulation.adaptive_mesh_refinement()` refines the
+  existing mesh locally, without remeshing in GMSH:
+  - New nodes are projected onto curved CAD faces and curves.
+  - Works on periodic models: every split on a periodic face is mirrored on its paired face, so the periodic meshes keep matching.
+  - You control how fast the mesh grows: `growth` (a float, a per-pass list, `"auto"` or a
+    callable), `growth_limits`, `order` and `theta`.
+  - Further options: how far refinement spreads (`max_depth`, `lepp_ratio`), quality
+    improvement (`improve_sweeps`, `improve_layers`, `improve_initial`, `improve_global`) and
+    thin-strip regularization (`strip_ratio`, `strip_max_growth`, `strip_gated`).
+  - `show_mesh` shows the mesh between passes.
+- **New adaptive frequency sweep.** `run_adaptive_sweep(tol, max_samples)` fits an AAA rational
+  model and adds samples until the estimated error is below `tol`. Use `model_S()`/`model_Smat()`
+  with `method='aaa'|'vf'|'auto'` and `tol` for a dense response.
+- `Mesher.set_global_max_size(size)` sets a global maximum element size in meters.
+- `Mesher.set_pec_domain(obj, size)` uses a coarse mesh inside PEC volumes.
+- `Mesher.set_algorithm(alg, nthreads)` sets the number of GMSH threads.
+- `Simulation.set_scale_factor(f)` (experimental) lets you model tiny structures, such as bond
+  wires, `f` times larger and scale the mesh back.
+
+### Physical attributes and automatic boundary conditions
+
+- Geometries carry a `properties` set. You can attach `FiniteThickness`, `SurfaceRoughness`,
+  `MetalCoating`, `VoidAttribute`, `WavePortAttribute`, `LumpedPortAttribute` and
+  `LumpedElementAttribute`, combined with `+`, for example
+  `obj.properties += em.FiniteThickness(35e-6) + em.SurfaceRoughness(1e-6)`.
+- Ports, lumped elements and voids are created from these attributes. Surface impedance and
+  thin conductor boundary conditions use the thickness and roughness.
+- **Voids:** a volume with `VoidAttribute` is cut out of all other volumes and its boundary
+  becomes PEC. A `Void` boundary condition is also available as `model.mw.bc.Void`.
+
+### Post-processing
+
+- `MWField.farfield_3d_ports(faces, ...)` returns the 3D far field of every port at once
+  (`{port: EHFieldFF}`), about 4× faster than exciting and computing each port separately.
+- `MWField.nearfield(x, y, z, faces, origin, syms, structure)` computes E and H at any point
+  outside a closed surface, including points outside the mesh. It accepts inputs of any shape
+  and returns an `EHField` of the same shape.
+- `MWField.trace_poynting_lines(...)` traces Poynting vector streamlines. Seeds come from points,
+  surfaces or domains, optionally weighted by field strength. Plot them with
+  `display.add_particle_lines()`.
+- `MWField.in_domain(selection, nodes, edges, tris, tets)` samples the field inside a domain.
+- `MWField.cache` reuses interpolation data for repeated evaluations at the same points.
+- `current_boundary(selection, eps, n_samples)` takes extra arguments and returns per-face
+  currents, centres and areas in `aux`.
+- `combine_ports(p1, p2, Z0renorm=...)` renormalizes all ports to a common reference before
+  combining them into differential and common mode.
+- `save_smatrix(..., Z0_override=...)`.
+- `embed_external_component()` can be called repeatedly on different ports.
+- `display.add_solution_error()` plots the error estimate.
+- `display.add_backgroundfields()` shows incident plane waves.
+- `display.show(zoom=...)`.
+- `populate(skip_air=True)` hides air objects.
+- `minimize_opacity` option on `add_object()`, `add_objects()` and `populate()`.
+
+### Boundary conditions and ports
+
+- **Multi-mode `WavePort`.** `model.mw.bc.WavePort(face, n, number_of_modes=N)` excites and absorbs
+  each mode with its own propagation constant, so modes with different β are absorbed without
+  reflection and without converting into each other (see `demo23_multimode_ports.py`).
+  - The set of modes is selected at the highest frequency and followed down the sweep, so an
+    S-matrix index (`1.1`, `1.2`, …) is the same physical mode at every frequency.
+  - Modes below cutoff stay in the S-matrix as evanescent modes (β = −jα).
+  - `number_of_modes=None` takes every mode that propagates at the highest frequency.
+  - A port face with one lossless, non-dispersive material is solved once and its modes are
+    scaled analytically to the other frequencies. This is detected automatically.
+- **Floquet ports with TE, TM and grating modes.**
+  `model.mw.bc.floquet_port(face, n, number_of_modes=..., polarization_deg=..., er=...)`:
+  - `number_of_modes=1` (default) keeps the single, polarization-mixed mode.
+  - `2` gives the TE00 and TM00 modes as `n.1` and `n.2`, each absorbed exactly.
+  - More modes add the higher diffraction orders (m, n) as TE and TM pairs; `None` takes every
+    order that propagates at the highest frequency. Evanescent orders can be included for ports
+    close to a structure.
+  - `FloquetPort.floquet_modes()` lists the S-matrix index, order (m, n) and polarization of
+    each mode; `FloquetPort.order_direction(freq, m, n)` gives the beam angles (θ, φ) of an
+    order, or `None` when it is evanescent (see `demo24_floquet_wire_grating.py`).
+- `port.smatrix_index(mode_nr)` returns the S-matrix index of a port mode, on every port.
+- `AbsorbingBoundary.optimize_for_maximum_angle(angle_deg)` and
+  `set_zero_angles(ang1_deg, ang2_deg)` tune the second-order ABC for a range of incidence
+  angles.
+- `FloquetPort(polarization_deg=...)` and `FloquetPort.set_polarization()`.
+- `ModalPort(modetype='any')` disables forcing a mode type.
+- `ScatteredField(definition='EA'|'SPH', material_correction=...)`. With
+  `material_correction=True`, the absorbing constant is scaled with the adjacent permittivity.
+- Spherical-coordinate background fields.
+- `model.mw.bc.get_port(n)` and `model.mw.bc.get_ports()`.
+- `model.mw.conducting_surfaces()`, `model.conducting_surfaces(level)` and
+  `model.conducting_volumes(level)` select all conductors at once.
+
+### Geometry and selections
+
+- `geo.connect_faces(face1, face2, ...)` lofts between two faces.
+- `geo.thick_wall(thickness, *volumes)` creates a wall of the given thickness around volumes.
+- `geo.duplicate(entity)` copies a geometry or selection.
+- `geo.SectionedDisc(radius, Nsections, ...)` is a disc with N perimeter segments, for clean
+  lofts.
+- `Cylinder(..., compensate_radius=True)` compensates the radius of a polygonal cylinder.
+- `Curve(..., multiplicities=...)` and `Curve.pipe(..., trihedron=...)`.
+- `CustomCell1D(u, ou)` and `CustomCell2D(u, ou, v, ov)` are periodic cells with arbitrary
+  lattice vectors.
+- `em.uniaxial_tensor(axis, ax_value, plane_value)` and `Axis.tensor(...)` build a uniaxial
+  material tensor ε⊥·I + (ε∥ − ε⊥)·n̂n̂ᵀ.
+- New `Selection` filters:
+  - `constrain(func, complete)`;
+  - `below()`, `above()`, `left_of()`, `right_of()`, `front_of()`, `behind()`;
+  - `around(distance, coordinate)`;
+  - `getCAs` returns `(centre, area)` for each tag.
+
+### PCB
+
+- `set_board_outline(xs, ys)` sets an arbitrary board outline polygon.
+- `generate_all(merge, height_air_top, height_air_bottom)` generates the board, air and vias in
+  one call.
+- `generate_silkscreen(material, thickenss_top, thickness_bottom)`.
+- Ports from `modal_port()`, `lumped_port()` and `lumped_port_pts()` are created automatically.
+- `via(..., annular_ring_radius=...)`.
+- `taper(distance, width, dx, dy, offset_r)`.
+- `pturn()` supports `'miter'`.
+- `turn()`, `pturn()` and `to()` remember the last used corner settings.
+- `move()`.
+- `pcb_to_dxf()` exports the PCB to DXF.
+
+### File import and export
+
+- `emerge.read.GDSFile` with `GDSLayer` stack-up definitions imports GDSII.
+- `emerge.read.GDSFromXML` imports GDSII with a gds2palace stack-up XML:
+  - derived (boolean) layers, via merging, dielectric stacks and `size_scale`;
+  - ports from markers and text labels.
+- `emerge.read.ODBImport` imports ODB++ (needs `emcad`).
+- `FileBasedPCB.layer_from_file(..., curved=True)` builds Gerber layers from exact arcs instead
+  of polygons.
+- `emerge.write.export_dxf` and `pcb_to_dxf`.
+- `emerge.optycal.surface_model()` and `farfield_model()` export data for Optycal.
+
+### Solvers
+
+- **Solvers are selected by class from `em.solvers`:** `model.set_solver(em.solvers.Pardiso)`.
+  Typing `em.solvers.` lists every solver (`SuperLU`, `UMFPACK`, `Pardiso`, `MUMPS`, `AASDS`,
+  `CuDSS`, `CHOLMOD`, `RSLab`, `Sparta`, `BiCGSTAB`, `CG`, `Corvid`, `LAPACK`, `ARPACK`).
+  - `em.solvers.available()` lists the solvers installed on this system. Each solver class has
+    `available` and `requires`, and its docstring says what it needs.
+  - Selecting a solver that is not installed raises an error that says what to install and
+    which solvers are available.
+  - `set_solver()` and `get_solver()` return the solver object with its own type, so editors
+    complete its methods: `model.set_solver(em.solvers.Sparta).set_options(mode='CPU')`.
+- `em.solvers.RSLab` (`rslab` package) is a direct solver.
+- `em.solvers.Sparta` (`sparta>=0.2.0`) is a direct solver with GPU, CPU and hybrid modes
+  (`set_options()`). When installed it is picked automatically, before the Apple Accelerate
+  solver, and runs on the device set with `set_device()` (below).
+- **`model.set_device("CPU" | "GPU" | "HYBRID")` selects the hardware of the direct solvers.**
+  The device belongs to the simulation's solve routine, like `set_solver()`.
+  - `"CPU"` (default) uses CPU solvers only. When SPARTA is installed it runs its CPU path,
+    the fastest direct solver for EMerge, before the Apple Accelerate solver.
+  - `"GPU"` uses SPARTA on the Apple GPU, otherwise cuDSS on an NVIDIA GPU. Without either it
+    warns and uses the CPU solvers.
+  - `"HYBRID"` uses SPARTA's combined GPU + CPU factorization (Apple silicon only). Without it,
+    `"GPU"` is used, with a warning.
+  - The device applies to the solver EMerge picks for systems with at least 10,000 unknowns.
+    Eigenmode problems and `worker_type="thread"` sweeps stay on the CPU. Worker processes of
+    `worker_type="process"` use SPARTA only, because cuDSS supports one solver per GPU.
+    SPARTA's `set_options(mode=...)` follows the device.
+- **`em.set_threads(n)` sets the number of CPU threads of EMerge.** It applies to the compiled
+  kernels (matrix assembly, interpolation, far fields, mesh processing), which used all logical
+  cores, and is the default `nthreads` of the solvers. It can be called at any time, also between
+  sweeps; `em.set_threads(None)` returns to the defaults and `em.get_threads()` returns the count.
+  An `nthreads=` argument of a run method takes precedence for the solver. Worker processes of
+  `worker_type="process"` use the same count.
+- **Thread count per solve.** `run_sweep()`, `run_scattered()`, `run_adaptive_sweep()`,
+  `adaptive_mesh_refinement()` and the thermal `run_steady_state()`, `run_transient()` and
+  `run_steady_state_nl()` take `nthreads=`. It is passed to the solver, which can also be set
+  directly with `Solver.set_nthreads(n)`. `None` keeps the solver's own setting.
+  - PARDISO sets the count for PARDISO only, through MKL, instead of reading `MKL_NUM_THREADS`.
+    `PardisoInterface(nthreads=...)` and `set_threads()` do the same.
+  - SPARTA (`sparta>=0.3.0`) gives the solver a thread pool of its own. A different count
+    repeats the symbolic analysis.
+  - Other solvers ignore it (logged at trace level).
+- `Solver.set_options()` and `set_nthreads()` return the solver, so calls can be chained:
+  `model.set_solver(em.solvers.Sparta).set_options(mode='CPU').set_nthreads(4)`.
+- `SolverCuDSS.set_precision('auto'|'single'|'double')`. `'auto'` uses single precision on GPUs
+  with slow double precision.
+- `Optimizer.set_method(...)` accepts any `scipy.optimize.minimize` method or `'direct'` (DIRECT
+  global search).
+- `Optimizer.print_python()`.
+
+### Macros
+
+- Yagi-Uda antenna design: `design_yagi`, `design_yagi_dl6wu` and `design_yagi_tapered`.
+- `SMAConnector` model.
+
+### Installation and tools
+
+- **The Apple Accelerate solver is installed automatically on macOS.** `emerge-aasds` is now a
+  precompiled PyPI package and a dependency of EMerge on macOS, so the fast Accelerate direct
+  solver works out of the box.
+- **macOS wheels are universal2**, one wheel with both Apple Silicon and Intel code, so Intel Macs
+  install a precompiled wheel instead of building from source.
+- `pip install emerge[spyder]` installs the packages needed to use EMerge in Spyder.
+
+### Experimental
+
+- `Microwave3D.solve_cnosdd(...)`: domain decomposition solver.
+- `ArrayTiling`/`ArrayLayout` define finite-array tilings.
+- `MLPreconData`: exports training data for ML preconditioners.
+
+---
+
+## 2. Breaking API changes
+
+### Installation and imports
+
+- **numba is removed.** EMerge ships compiled wheels; building from source needs a Rust
+  toolchain. The `emerge compile` command is removed.
+- The **`gerber` extra is renamed to `cad`**.
+- **The `emerge` command line tool is removed** (`emerge install-solver`, `python -m emerge`). Install
+  optional solvers with pip, e.g. `pip install emerge[cad]`.
+- The minimum `emsutil` version is 1.1.3.
+- **`emerge.beta` is removed:**
+  - `emerge.beta.gerber.FileBasedPCB` → `emerge.read.FileBasedPCB`
+  - `emerge.beta.dxf.import_dxf` → `emerge.read.import_dxf`
+  - `emerge.beta.dxf.export_dxf`, `pcb_to_dxf` → `emerge.write.export_dxf`, `emerge.write.pcb_to_dxf`
+- `SimulationBeta` is removed.
+- The module-level singletons (`_GEOMANAGER`, `LOG_CONTROLLER`, `DEBUG_COLLECTOR`, `SELECTOR_OBJ`,
+  `_PCB_MANAGER`, `DEFAULT_ROUTINE`, …) are removed. `em.cleanup()` still works.
+
+### Simulation
+
+- **`commit_geometry()` takes no arguments anymore.**
+- **The default save format is `msgpack`** (was `joblib`). msgpack cannot store Python functions,
+  for example lumped element impedance functions; use `store_system="joblib"` for those.
+- **`generate_mesh()` no longer removes orphan surfaces by default.** Pass `remove_orphans=True`.
+- **`adaptive_mesh_refinement()` has new arguments.** `refinement_ratio`, `growth_rate`,
+  `minimum_refinement_percentage`, `error_field_inclusion_percentage` and `ensure_mesh_growth`
+  are removed. `adaptive_mesh_refinement_new()` is removed.
+- `data.sim.iterate()` yields `DataEntry` objects (`.vars`, `.data`, `.reports`) instead of
+  `(vars, dict)` tuples.
+
+### Microwave
+
+- **`run_adaptive_sweep()`**: `n_max_new` is replaced by `tol` and `max_samples`.
+- **`run_sweep()` and `run_scattered()` are sequential; `run_sweep_distributed()` and
+  `run_scattered_distributed()` solve several frequency points at once.**
+  `run_sweep(parallel=True, n_workers=4)` read as "use multiple cores", but the solver is always
+  multi-threaded: it solves 4 frequency points at the same time. That is now
+  `run_sweep_distributed(n_workers=4, nthreads=...)`, which uses `n_workers × nthreads` threads.
+  `multi_processing=True` became `worker_type="process"`. `run_sweep()` and `run_scattered()`
+  still accept `parallel`, `n_workers` and `multi_processing` for now, with a deprecation warning.
+- **`MWField.farfield()` returns an `EHFieldFF`** (use `.E`, `.H`) instead of an `(E, H, Ptot)`
+  tuple.
+- **`farfield_3d()` arrays are indexed `(theta, phi)`** (were `(phi, theta)`).
+- **`ScatteredField` uses standard spherical angles by default** (`definition='SPH'`). Pass
+  `definition='EA'` for the old convention.
+- **`embed_external_component()`:**
+  - `MWField.embed_external_component()` no longer takes `Smat`.
+  - Embedded ports are no longer deleted. They stay in `Sp` as `NaN` and keep their numbers.
+  - The `MWScalarNdim` version modifies the dataset in place.
+  - Exciting an embedded port raises `KeyError`.
+- `MWScalarNdim.Smat` returns `Sp`, including `NaN` entries for embedded ports.
+- `eigenmode(deep_search=...)` is removed.
+- `Microwave3D.frequency_domain()` (the alias of `run_sweep()`) is removed.
+- `BoundaryCondition.details()` is removed.
+- `get_Uinc()` moved from the individual port classes to the `PortBC` base class.
+- **`WavePortIH` is deprecated.** It still works, with a warning, as
+  `WavePort(..., modetype="TEM")`.
+- **`ModalPort` with several modes requires one propagation constant.** It absorbs all its modes
+  with one β, which only works for degenerate modes (e.g. the two TE11 polarizations). Use
+  `WavePort` for modes with different β.
+- **`ModalPort` raises `BoundaryConditionError` when fewer modes propagate than
+  `number_of_modes`**, before the sweep. It used to crash with `ZeroDivisionError` after it.
+- `modal_analysis(..., direct=True)` stores the `nmodes` modes closest to the target instead of
+  every propagating mode.
+
+### Solvers
+
+- **`EMSolver` is removed.** Select solvers with the classes in `em.solvers`:
+  `em.EMSolver.PARDISO` → `em.solvers.Pardiso`. `em.EMSolver` remains for a few versions so old
+  scripts still autocomplete, but using a member raises an error that names its replacement.
+- `SolveRoutine.solvers` is keyed by solver class; `SolveRoutine.disable()` takes classes.
+- `emerge._emerge.solver` is split into `emerge._emerge.solveroutine` (`SolveRoutine`,
+  `AutomaticRoutine`) and the package `emerge._emerge.solvers`, with one module per solver.
+  `emerge.ext` is unchanged.
+- `SmartARPACK` is removed and `SmartARPACK_BMA` is renamed to `SolverARPACK_BMA`. Its `eig()`
+  takes a list of shifts: `eig(A, B, nmodes, shifts, kmax2, direct, keep_evanescent, descending)`.
+- `CuDSSInterface.set_algorithm('COLAM_BT')` is now `'COLAMD_BT'`.
+
+### Geometry, selections and meshing
+
+- **`face()`, `faces()`, `boundary()` and `all_faces()` exist only on `GeoVolume`.** They are no
+  longer available on surfaces, edges or points.
+- **`GeoObject.material` is read-only.** Use `set_material()` or `obj.properties += mat`.
+  `_mdi`, `_store()` and `_load()` are removed.
+- **`Selection.exclude()`: the `plane` argument is removed.**
+- `Selection.code()`, `encode_data()` and `decode_data()` are removed.
+- `geo.stick()`: the first argument is renamed from `object` to `obj`.
+- `Mesher.set_face_size()` on a non-surface raises `MeshError`. It used to warn and forward.
+- `Mesher.set_algorithm()` uses 1 GMSH thread by default (was 16).
+- The old AMR helpers are removed: `Mesher.add_refinement_points()`,
+  `set_error_size_field()`, `clear_error_size_field()`, `AMRPoints` and the `adaptive_mesh`
+  helper functions.
+
+### PCB
+
+- **`PCBNew` is renamed to `PCB`.** `PCBNew` is kept as an alias. The old deprecated `PCB`
+  wrapper is removed.
+- **z-coordinates are replaced by layer indices** (counted from 0; negative indices count from
+  the top):
+
+  | 2.8.9 | 3.0 |
+  |---|---|
+  | `pcb.new(x, y, w, dir, z=pcb.z(1))` | `pcb.new(x, y, w, dir, trace_layer=1)` (default `-1`, top) |
+  | `pcb.plane(pcb.z(0))` | `pcb.plane(0)` |
+  | `.via(pcb.z(0), radius)` | `.via(0, radius)` |
+  | `pcb.add_poly(xs, ys, z=...)` / `add_hole(...)` | `(xs, ys, layer=0)` |
+  | `pcb.add_vias(..., z1=, z2=)` | `pcb.add_vias(..., layer1=0, layer2=-1)` |
+  | `pcb.radial_stub(..., z=)` | `pcb.radial_stub(..., layer=-1)` |
+  | `lumped_element_from_sp(..., z_gnd=)` | `lumped_element_from_sp(..., ground_layer=0)` |
+  | `StripLine/StripTurn/StripCurve/PCBPoly(..., z, ...)` | `(..., layer, ...)` |
+
+- **Port methods take a port number and create the boundary condition:**
+
+  | 2.8.9 | 3.0 |
+  |---|---|
+  | `mp = pcb.modal_port(pcb.load("p1"), height)` + `model.mw.bc.ModalPort(mp, 1)` | `pcb.modal_port("p1", 1, height)` |
+  | `lp = pcb.lumped_port(pcb.load("p1"))` + `model.mw.bc.LumpedPort(lp, 1)` | `pcb.lumped_port("p1", 1)` |
+  | `pcb.lumped_port_pts(p1, p2, z, z_ground)` | `pcb.lumped_port_pts(p1, p2, layer, port_number, ground_layer=0)` |
+
+  Remove the separate `model.mw.bc.ModalPort(...)`/`LumpedPort(...)` calls and get the ports with
+  `model.mw.bc.get_port(n)`.
+- `trace_thickness` defaults to 35 µm (was `None`).
+
+### Changed defaults that change results
+
+- `Settings.qtem_limit` 0.05 → 0.1: more quasi-TEM modes are treated as TEM.
+- `run_sweep()`/`run_scattered()`: `harddisc_path` is relative to the model directory.
+- `pmlbox()`: the PML grading `exponent` 1.5 → 0.5 and `deltamax` 8.0 → 2.0.
+- **`ModalPort` modes are solved again at every frequency** unless they are exact at all
+  frequencies (one material and only TEM modes). Results of dispersive ports, such as
+  microstrip, change: the dispersion is now included. These sweeps are slower.
+- **TEM ports whose mode voltage came out negative now flip their mode** (`flip_polarity` did
+  nothing before). The S-parameters of such ports rotate by 180°.
+- **`FloquetPort` with `number_of_modes=1`** (the default) still has one S-matrix entry, but now
+  absorbs the TE00 and TM00 parts of the field exactly instead of with one blended propagation
+  constant. Results at oblique incidence change slightly.
+
+### Migrating a 2.8.9 script
+
+1. Update the version check: `model.check_version("3.0.8")`.
+2. Replace `em.geo.PCBNew` with `em.geo.PCB`, and `pcb.z(i)` arguments with layer indices.
+3. Give `pcb.modal_port()`/`pcb.lumped_port()` a port number, delete the matching
+   `model.mw.bc.ModalPort(...)`/`LumpedPort(...)` calls, and use `model.mw.bc.get_port(n)`.
+4. Remove arguments from `model.commit_geometry()`.
+5. Use `store_system="joblib"` if you save lumped element functions.
+6. Read far fields from the returned `EHFieldFF` (`ff.E`, `ff.H`), and check the axis order of
+   `farfield_3d()` arrays.
+7. Pass `definition='EA'` to `ScatteredField` if your angles use the old convention.
+8. Replace `emerge.beta.*` imports with `emerge.read`/`emerge.write`.
+9. Update `adaptive_mesh_refinement()` and `run_adaptive_sweep()` calls to the new arguments.
+10. Replace `em.EMSolver.X` with the class from `em.solvers`, for example
+    `model.set_solver(em.solvers.Pardiso)`.
+11. Replace `WavePortIH` with `WavePort`, and multi-mode `ModalPort`s whose modes have different
+    propagation constants with `WavePort(..., number_of_modes=N)`.
+12. Replace `run_sweep(parallel=True, n_workers=N)` with `run_sweep_distributed(n_workers=N)`
+    (`run_scattered` likewise), and `multi_processing=True` with `worker_type="process"`.
+
+---
+
+## 3. Bug fixes, accuracy and performance
+
+### Bug fixes
+
+- **`ModalPort` in dielectric-filled guides:** the propagation constant was extrapolated to other
+  frequencies without εr·µr. Dielectric-filled waveguides reflected at their own ports, up to
+  |S11| = 0.41.
+- **Port modes from the iterative mode solver:** valid modes were dropped by a fixed threshold on
+  the eigenvector norm (xᴴBx > 0.1), which TM modes can fail. A round guide returned one mode of
+  its TE01/TM11 cluster and then two farther modes instead of the other two. Modes are now
+  accepted on their eigenvalue and residual. (Found by FreeSpaceMind.)
+- **`PortMode.flip_polarity()`** did nothing: E and H share one array and were flipped twice.
+- **`set_scanangle()` before creating ports or periodic boundaries** was lost. The cell now
+  stores the scan angle and applies it to boundaries and ports created later.
+- **`Simulation.get_solver()`** raised `KeyError` for a solver object or a solver that is not
+  installed, and so did `set_solver()` when given a solver object.
+- **`AutomaticRoutine`** raised `KeyError` for iterative solves when CORVID is not installed. It
+  now falls back to another solver.
+- **Far field on a surface inside the mesh** (e.g. the air/PML interface):
+  - The normals of the integration surface pointed into the PML side on each triangle that has a
+    tetrahedron on both sides. Ptot (radiated power) came out negative, or near zero when only
+    some faces flipped, so directivity read far too high or NaN while the pattern looked right.
+    The normals are now oriented consistently over the surface and outward.
+  - The fields on the surface were sampled in the PML tetrahedra, which overestimated the radiated
+    power (by 46 % for a test dipole). They are now evaluated on the surface itself, in a
+    tetrahedron next to each surface triangle: the one inside the surface (the air side of a PML
+    interface), or the one outside where the inside has no field, such as the surface of a PEC
+    scatterer for an RCS. No point location search is needed. This applies to `farfield*`,
+    `nearfield` and `farfield_3d_ports`.
+- **Ports with 10 or more modes:** mode labels collided (mode 10 → `1.10` == `1.1`, the label of
+  mode 1), so the S-parameters of those modes silently overwrote each other. On such ports the
+  mode number is now zero-padded (`1.01` … `1.12`), so mode 1 is `S(1.01, …)`. Ports with up to 9
+  modes keep `1.1` … `1.9`. (Found by asirinelli.)
+- **`ThinConductor`:** the two sides of a thin conductor sheet were not separated in the solve.
+  The volume was assembled with the unsplit numbering, only one tet per sheet triangle got the
+  copied DoFs (not the tets that touch the sheet through an edge), and the copied side was picked
+  at random per triangle. Now every tet on one side of the sheet uses the copies, and the solve,
+  the fields, the far fields and the error estimate all use the same numbering.
+- **Multithreaded sweeps:** every worker thread got the same solve routine, so threads replaced
+  each other's solvers and could factorize in the same PARDISO handle at once (occasional
+  segmentation faults in MKL). Each thread now gets its own routine and solvers, also for a solver
+  forced with `set_solver()`.
+- **Selections:** `Selection.exclude()` and `isolate()` returned wrong selections (`~` was used
+  on Python booleans).
+- **`ModalPort`/`WavePortIH`:** passing `cs=...` raised
+  `ValueError: No Coordinate System could be derived`. A copy of the given `cs` is now used.
+- **`SurfaceImpedance(surface_conductivity=...)`** was ignored.
+- **`combine_ports()`:**
+  - Non-sequential port numbers now work.
+  - `Z0renorm` passed the impedances to the renormalization in the wrong order.
+  - The new reference impedance is now stored.
+- **`embed_external_component()`** used wrong port indices when port numbers were not 1…N.
+- **`ScatteredField.set_excitations()`:** each theta × phi × polarization combination is now
+  solved exactly once. Equal-length arrays were broadcast and then combined, which repeated
+  combinations.
+- **Thermal `FixedTemperature`** crashed (`node_to_ield` typo).
+- **`HexCell`** used `max(z2, z2)` for the cell height.
+- **Periodic face pairing** also compares face areas, so faces with the same centre are no longer
+  mispaired.
+- **Pardiso:**
+  - The zero right-hand-side vector had the wrong shape.
+  - `IPARM[0]` was never set, so MKL ignored every other IPARM value and ran on its defaults.
+  - Errors in the symbolic and numeric factorization were discarded. They now raise a
+    `SimulationError`, and the symbolic phase is redone after `reset()`.
+  - `nthreads` was written to `IPARM[2]`, which MKL does not use.
+  - Non-symmetric systems (periodic boundaries) were solved as Aᵀx = b instead of Ax = b, because
+    PARDISO read the CSC matrix as CSR. A lossless dielectric slab in a Floquet cell at 30° lost
+    31 % of its power. Symmetric systems were not affected.
+- **Degenerate port modes:** the eigen solver returns an arbitrary basis of modes that share one
+  propagation constant, which could mix the modes and make lossless modes complex. Those modes
+  are now orthogonalized in the cross power and given a real basis.
+- **Modal analysis:** running it again at the same frequency added a second set of modes. It now
+  replaces the modes found before.
+- **AURA:** new nodes on a curved face could stay on the chord where the surface mesh ran over a
+  concave diagonal, leaving dents in the refined surface (up to 14 mm on a 250 mm sphere). Such
+  wedges are now flipped to the convex diagonal before refinement.
+- **`XYPolygon` fillets** were inserted at shifted positions when more than one fillet was used.
+- **`XYPolygon.rect()`** raised an error for a 2D origin `(x, y)`.
+- **Ports with several modes:** the default excitation of a field and `farfield_3d_ports()` excited
+  the port number (`1`) instead of the mode index (`1.1`), which gave a zero field and far field.
+  `excite_port()` with a number that is not a port mode now raises an error that lists the modes.
+- **STEP import:** integer values were rejected where floats were expected.
+- **`Curve`** no longer opens the FLTK GUI.
+- **cuDSS:**
+  - Works with nvmath-python 0.5 and 1.0 and cuDSS 0.8.
+  - `set_algorithm()` now takes effect.
+  - A failing cuDSS import no longer breaks `import emerge`.
+- Boolean operations no longer try to assign a missing material.
+
+### Accuracy improvements
+
+- **`FloquetPort` absorbs TE and TM modes exactly**, each with its own propagation constant (it
+  used one blended value for both). A dielectric slab at 40° oblique incidence matches the
+  analytic result to 4·10⁻⁴; a lamellar grating matches RCWA diffraction efficiencies to 0.0015.
+
+- **Triangle quadrature:** the 7-point rule (`STRANG6`) had a typo in two barycentric coordinates.
+  Order-4 surface integrals and boundary terms that used it were slightly inaccurate.
+- **Second-order ABC:** separate TE (surface curl) and TM (surface divergence) correction terms
+  improve absorption at oblique incidence.
+- **Modal analysis:**
+  - The εr/µr estimate is taken over the port only (it used to include values from the whole
+    mesh).
+  - H-field interpolation uses the port permeability.
+  - Non-propagating modes are ignored.
+  - Mode signs are made consistent between meshes (a warning is shown when this is ambiguous).
+- **Surface currents (`current_boundary()`):** samples several offsets, weights by triangle area
+  and removes the normal component.
+- **Robin boundary conditions** use a higher-order quadrature.
+- **Inconsistent GMSH meshes** (tetrahedra that reference missing nodes) are detected and
+  reported with a fix, instead of failing later with an unexplained `KeyError`.
+- Volumes with negative orientation are rebuilt automatically.
+- Lumped port and lumped element mesh-size constraints follow the model scale factor.
+
+### Performance
+
+- No JIT compilation: the first-run delay is gone.
+- **Coax and other ports with a conductor in the port face** solve their modes once per sweep
+  again, instead of at every frequency. The conductor (e.g. a PEC inner conductor) is PEC in
+  the port eigenproblem, so its material no longer makes the port face count as mixed materials.
+- Removing the prescribed degrees of freedom before a solve is done in one parallel pass, about
+  10× faster on large systems and without an intermediate matrix copy.
+- Faster assembly:
+  - Rust kernels.
+  - A sparsity pattern that is cached across frequencies.
+  - Tetrahedra inside PEC or highly conducting volumes are skipped.
+- Lower memory use in Robin boundary condition assembly.
+- SuperLU solves several right-hand sides in one call.
+- PARDISO factors complex-symmetric systems (most models) as LDLᵀ instead of LU, with explicit
+  settings for ordering, pivoting, scaling and refinement. About 30% faster numeric factorization
+  on an 84k system.
+- ARPACK uses an explicit shift-invert LU with an oversampled Krylov space.
+- **Port modes:** one solver for `ModalPort` and `WavePort` (`SolverARPACK_BMA`): a dense solve on
+  small port faces, otherwise one shift-invert solve per cluster of target propagation constants.
+  Copies of a mode found from several shifts are removed with a cross-modal assurance criterion.
+- A homogeneous `WavePort` face is solved once instead of at every frequency (port modes of a
+  waveguide step sweep: 28 s → 2 s).
+- S-parameter post-processing interpolates the solution once per port instead of once per mode
+  (a 30-mode Floquet port: 9 s → 3 s).
+- With multiprocessing, the worker pool and each worker's solver state are reused across
+  frequency groups, so cached symbolic factorizations survive.
+
+---
+
+## 4. Internal changes
+
+- All numba code is ported to the Rust crate `emr`, built with maturin. This covers curl-curl,
+  Robin, ABC, periodic, eigenmode, Stratton-Chu, error estimation, interpolation, integrals and
+  heat kernels.
+- Global state lives in one `GLOBALHANDLER`: geometry manager, key generator, PCB manager,
+  simulation states, selector, log controller and debug collector.
+- `MaterialAssignment` replaces `_get_material_assignment()`. Material properties are evaluated
+  with tetrahedron centres and IDs.
+- `run_sweep()` and `run_scattered()` share one frequency-domain driver (`_run_frequency_domain`,
+  `_dispatch_jobs`).
+- The default boundary conditions are generated once (`_autogenerate_bcs`), and the boundary
+  condition data is initialized once per mesh.
+- Assembly uses a `SystemPattern` with a cached COO→CSC map. Explicit zero elimination is
+  removed.
+- `diagnose_matrix()` raises `MatrixDiagnosisError` with the coordinates of the problematic
+  degrees of freedom.
+- The microwave and heat physics of a `Simulation` share one solve routine.
+- `solver.py` and `solve_interfaces/` are split into `solveroutine.py` and a `solvers/` package
+  with one module per solver, each holding the interface to its library and the `Solver` class.
+- Ports describe their modes through `PortBC` methods (`mode_beta`, `mode_Z0`, `is_propagating`,
+  `sparam_projection`) instead of `isinstance` checks in the post-processing.
+- `WavePort` and `FloquetPort` assemble a dense port block (`assembly/wpbc_multimode.py`).
+- Face tags of named faces are cached on `GeoVolume`.
+- `GeoObject._become()` replaces an object in place, for example when voids are subtracted.
+- Launch messages and the version banner are only shown in the main process. Spyder is detected and
+  the PyVista backend is set automatically.
+- More informative logging:
+  - every boundary condition and its attributes;
+  - the port impedance with its definition;
+  - the mesh size after meshing;
+  - frequency sanity warnings for all solve entry points.
+- The face-label view shows `object<face>` names.
+- `emerge.plot` is its own module, re-exporting the emsutil plotting functions.
+- New test suite: thermal, WPBC, solvers, save/load, ABC, AMR, combine ports, background fields,
+  impedances, power, near field, wave ports, multi-mode wave ports, Floquet ports, degenerate
+  port modes and demo references.
+- The release workflow builds abi3 wheels for Linux, macOS and Windows and publishes to PyPI
+  when the version in `pyproject.toml` is new.

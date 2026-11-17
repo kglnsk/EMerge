@@ -141,20 +141,22 @@ def build_and_solve(
 
     label = "WaveguideEquivalent" if waveguide_equivalent else "FreeSpace"
     with em.Simulation(f"FloquetPatch{label}") as model:
-        model.check_version("2.8.0")
-        model.set_solver(em.EMSolver.SUPERLU)
+        model.check_version("3.0.8")
+        model.set_solver(em.solvers.SuperLU)
 
         cell = em.RectCell(cell_size, cell_size)
         model.set_periodic_cell(cell)
         substrate = cell.volume(z_ground, z_patch).set_material(substrate_material)
         air = cell.volume(z_patch, z_port).background()
-        ground = cell.port_face(z_ground).assign_thickness(copper_thickness)
+        ground = cell.port_face(z_ground)
         patch = em.geo.XYPlate(
             patch_size,
             patch_size,
             position=(0.0, 0.0, z_patch),
             alignment=em.CENTER,
-        ).assign_thickness(copper_thickness)
+        )
+        ground.properties += em.FiniteThickness(copper_thickness)
+        patch.properties += em.FiniteThickness(copper_thickness)
         ground.set_material(copper)
         patch.set_material(copper)
         port_face = cell.port_face(z_port)
@@ -188,15 +190,17 @@ def build_and_solve(
             model.mw.set_frequency(frequencies)
             cell.set_scanangle(0.0, 0.0)
             start = perf_counter()
-            data = model.mw.run_sweep(
-                parallel=args.workers > 1,
-                n_workers=args.workers,
-                frequency_groups=args.frequency_groups,
-            )
+            if args.workers > 1:
+                data = model.mw.run_sweep_distributed(
+                    n_workers=args.workers,
+                    frequency_groups=args.frequency_groups,
+                )
+            else:
+                data = model.mw.run_sweep(frequency_groups=args.frequency_groups)
             solve_seconds = perf_counter() - start
             grid = data.scalar.slice_set(0, None, sort_by="freq").grid
             solved_freq = np.asarray(grid.freq)
-            raw = np.asarray(grid.S(1.1, 1.1))
+            raw = np.asarray(grid.S(1, 1))
             theta_deg = np.zeros_like(solved_freq)
             beta = 2.0 * np.pi * solved_freq / C0
             point_seconds: list[float] | None = None
@@ -219,15 +223,13 @@ def build_and_solve(
                 cell.set_scanangle(float(np.degrees(theta)), 0.0)
 
                 start = perf_counter()
-                data = model.mw.run_sweep(
-                    parallel=False, n_workers=1, frequency_groups=1
-                )
+                data = model.mw.run_sweep(frequency_groups=1)
                 point_seconds.append(perf_counter() - start)
                 latest = data.scalar.slice_set(
                     data.scalar.n - 1, None, sort_by="freq"
                 ).grid
                 raw_values.append(
-                    complex(np.asarray(latest.S(1.1, 1.1)).reshape(-1)[-1])
+                    complex(np.asarray(latest.S(1, 1)).reshape(-1)[-1])
                 )
                 theta_values.append(float(np.degrees(theta)))
                 beta_values.append(float(k0 * np.cos(theta)))

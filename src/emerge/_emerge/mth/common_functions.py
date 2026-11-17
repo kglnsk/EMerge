@@ -17,6 +17,9 @@
 
 # Last Cleanup: 2025-01-01
 import numpy as np
+from ..cs import _parse_axis, Axis, _parse_vector
+from emsutil import Material, FreqDependent
+from emsutil.lib import EPS0
 
 def norm(Field: np.ndarray) -> np.ndarray:
     """ Computes the complex norm of a field (3,N)
@@ -50,7 +53,7 @@ def coax_rin(rout: float,
     """Computes the inner radius given a dielectric constant, outer radius and characteristic impedance
 
     Args:
-        rin (float): The outer radius
+        rout (float): The outer radius
         eps_r (float, optional): The dielectric permittivity. Defaults to 1.
         Z0 (float, optional): The impedance. Defaults to 50.
 
@@ -95,6 +98,10 @@ def dot(A, B):
       - (3, N)      : 3-by-N, treated as N vectors of length 3
       - (N, 3)      : N-by-3, treated as N vectors of length 3
 
+    Args:
+        A (np.ndarray): The first vector(s), shape (3,), (3, N) or (N, 3)
+        B (np.ndarray): The second vector(s), same shape as A
+
     Returns:
       - scalar for (3,)·(3,)
       - (N,) for pairwise dot of N vectors.
@@ -117,6 +124,10 @@ def cross(A, B):
       - (3, N)
       - (N, 3)
 
+    Args:
+        A (np.ndarray): The first vector(s), shape (3,), (3, N) or (N, 3)
+        B (np.ndarray): The second vector(s), same shape as A
+
     Returns:
       - (3,) for single cross product
       - (3, N) for pairwise cross of N vectors.
@@ -135,3 +146,85 @@ def cross(A, B):
     c3 = a1 * b2 - a2 * b1
 
     return np.array((c1, c2, c3))
+
+def lumped_element_material(material_name: str,
+                  direction: tuple[float, float, float] | Axis,
+                  length: float, 
+                  Area: float, 
+                  C: float | None = None, 
+                  L: float | None = None, 
+                  R: float | None = None,
+                  color: str = "#999999",
+                  opacity: float = 0.2) -> Material:
+    """Generates a material that effectively turns some volume into a lumped element.
+    The volume must be approximately that of an extruded surface like a box or cylinder.
+    This extruded volume must be extruded in the current direction and the start and end surfaces
+    must be a conductor. Then the volume in between can be assigned this material which will turn the
+    volume into an effective lumped element with the provided capacitance, inductance, resistance or mix of all.
+
+    The materials must be assigned a unique name.
+
+    Args:
+        material_name (str): The material name.
+        direction (tuple[float, float, float] | Axis): The direction in which the lumped element is oriented. This is the current direction.
+        length (float): The length of the lumped element component.
+        Area (float): The cross sectional area of the lumped element component.
+        C (float | None, optional): The capacitance in F. Defaults to None.
+        L (float | None, optional): The inductance in H. Defaults to None.
+        R (float | None, optional): The resistance in Ω. Defaults to None.
+        color (str, optional): The rendering color of the material
+        opacity (float, optional): Trendering opacity of the material.
+
+    Returns:
+        Material: The effective lumped element material.
+    """
+    # Ensure direction is a unit vector
+    dirvec = _parse_vector(direction)
+    norm = np.linalg.norm(dirvec)
+    if norm > 0:
+        dirvec /= norm
+        
+    dvout = np.outer(dirvec, dirvec)
+    
+    # Presence flags
+    incl_R = 1.0 if R is not None else 0.0
+    incl_L = 1.0 if L is not None else 0.0
+    
+    # Set default dummy values for inactive elements to avoid division by zero
+    C_val = C if C is not None else 0.0
+    R_val = R if R is not None else 1.0
+    L_val = L if L is not None else 1.0
+    
+
+
+    def _fer(f):
+        w = 2 * np.pi * f
+        
+        # Real terms: Capacitance (positive) and Inductance (negative, dispersive)
+        real_part = (C_val * length) / (EPS0 * Area) - (incl_L * length) / (w**2 * L_val * EPS0 * Area)
+        
+        # Imaginary term: Resistance (conductive loss)
+        imag_part = - (incl_R * length) / (w * R_val * EPS0 * Area)
+        
+        # Scalar complex relative permittivity along the element axis
+        er_scalar = real_part + 1j * imag_part
+        
+        # Dyadic projection tensor: er_scalar along u, 1.0 (free space) orthogonal to u
+        return dvout * (er_scalar - 1.0) + np.eye(3)
+    
+    erf = FreqDependent(matrix=_fer)
+    return Material(er=erf, color=color, opacity=opacity, name=material_name)
+
+def uniaxial_tensor(axis: np.ndarray | tuple | Axis, ax_value: complex, plane_value: complex) -> np.ndarray:
+    """Generate a uniaxial tensor for a given axis and an along-axis value and in plane value (normal to the axis)
+
+    Args:
+        axis (np.ndarray | tuple | Axis): The the uniaxial axis
+        ax_value (complex): The value along the axis
+        plane_value (complex): The value normal to the axis
+
+    Returns:
+        np.ndarray: The resultant 3x3 tensor
+    """
+    axis = _parse_axis(axis)
+    return axis.tensor(ax_value, plane_value)

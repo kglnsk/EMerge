@@ -86,8 +86,6 @@ class Legrange2(FEMBasis, Saveable):
 
         self.diagnose()
 
-        self.empty_tri_rowcol()
-
     def partition_dof(self, list_tags: list[list[int]]) -> None:
         """Partition_DOF splits the degrees of freedom for an input list of face tags."""
         tags: list[int] = []
@@ -177,8 +175,7 @@ class Legrange2(FEMBasis, Saveable):
 
     def diagnose(self):
         visited_field = np.zeros((self.n_field,), dtype=np.bool_)
-        for i in range(self.mesh.n_tets):
-            visited_field[self.tet_to_field[:, i]] = True
+        visited_field[self.tet_to_field] = True
         assert np.all(visited_field)
 
     def interpolate(
@@ -261,5 +258,5 @@ class Legrange2(FEMBasis, Saveable):
         n_zeros = np.isnan(vals).sum()
         if not usenan and n_zeros > 0:
             logger.debug(f"Converted {n_zeros} to zeros.")
-            vals[vals == -1] == 0
+            vals[vals == -1] = 0
         return vals

@@ -34,7 +34,7 @@ dx = 2 * mm  # distance from horn exit to PML start
 # Create simulation object
 
 model = em.Simulation("StandardGainHornAntenna")
-model.check_version("2.8.0")  # Checks version compatibility.
+model.check_version("3.0.8")  # Checks version compatibility.
 
 # --- Coordinate system for horn geometry -------------------------------
 hornCS = em.CS(em.YAX, em.ZAX, em.XAX)
@@ -72,7 +72,7 @@ air, *pmls = em.geo.pmlbox(
     rat * WH / 2,  # half-height in Y
     rat * HH / 2,  # half-width in Z
     (Lhorn - dx, 0, 0),  # PML origin offset along X
-    thickness=4 * mm,
+    thickness=2 * mm,
     N_mesh_layers=4,
     sides="TRA",  # [T]op, [R]ight, B[A]ck
 )
@@ -81,7 +81,7 @@ air2 = em.geo.subtract(air, horn_out)
 
 # --- Solver parameters --------------------------------------------------
 model.mw.set_frequency_range(90e9, 110e9, 11)  # 90–110 GHz sweep
-model.mw.set_resolution(0.3)  # mesh resolution fraction
+model.mw.set_resolution(0.2)  # mesh resolution fraction
 
 # --- Assemble geometry and mesh -----------------------------------------
 model.generate_mesh()
@@ -100,7 +100,7 @@ abc = model.mw.bc.AbsorbingBoundary(
 model.view(selections=[radiation_boundary], bc=True)
 
 # --- Run frequency-domain solver ----------------------------------------
-data = model.mw.run_sweep()
+data = model.mw.run_sweep(frequency_groups=1)
 
 # --- Plot return loss ---------------------------------------------------
 scal = data.scalar.grid
@@ -120,9 +120,9 @@ ff_data = data.field[0].farfield_2d(
 plot_ff(ff_data.ang * 180 / np.pi, ff_data.gain.norm, dB=True, ylabel="Gain [dBi]")
 # Normalize to free-space impedance and convert to dB
 
-model.display.add_object(horn_in, opacity=0.1)
-model.display.add_object(air2, opacity=0.1)
-model.display.add_object(feed, opacity=0.1)
+model.display.add_object(horn_in)
+model.display.add_object(air2)
+model.display.add_object(feed)
 
 ff3d = data.field[0].farfield_3d(
     radiation_boundary, syms=["Ez", "Hy"], origin=(0, 0, 0)

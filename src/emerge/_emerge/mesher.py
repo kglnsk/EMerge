@@ -27,6 +27,25 @@ from enum import Enum
 from .bc import Periodic, BoundaryCondition
 
 
+
+# [Written by Claude]
+def _curve_sampling(curve_tags: list[int], size: float) -> int:
+    """The number of sample points per curve for a gmsh Distance field.
+
+    The Distance field measures the distance to points sampled on each curve, not to the curve itself.
+    With a fixed number of samples, long curves get sample points far apart and the mesh size pulsates
+    between them. Sample at least twice per mesh size (the same count is used for every curve in the field).
+
+    Args:
+        curve_tags (list[int]): The curves of the Distance field
+        size (float): The target mesh size near the curves (modelling units)
+
+    Returns:
+        int: The number of sample points per curve (at least 100)
+    """
+    length = max((gmsh.model.occ.getMass(1, tag) for tag in curve_tags), default=0.0)
+    return max(100, int(np.ceil(2 * length / size)) + 1)
+
 class MeshError(Exception):
     pass
 
@@ -65,101 +84,10 @@ _DOM_TO_STR = {
 T = TypeVar("T")
 
 
-def unpack_lists(_list: Any, collector: list | None = None) -> list[Any]:
-    """Unpack a recursive list of lists"""
-    if collector is None:
-        collector = []
-    for item in _list:
-        if isinstance(item, list):
-            unpack_lists(item, collector)
-        else:
-            collector.append(item)
-
-    return collector
-
-
-class AMRPoints:
-    def __init__(self):
-        self._amr_fields: list[int] = []
-        self._amr_coords: np.ndarray = None
-        self._amr_sizes: np.ndarray = None
-        self._amr_ratios: np.ndrray = None
-        self._amr_new: np.ndarray = None
-
-    def reset(self):
-        self._amr_fields: list[int] = []
-        self._amr_coords: np.ndarray = None
-        self._amr_sizes: np.ndarray = None
-        self._amr_ratios: np.ndrray = None
-        self._amr_new: np.ndarray = None
-        self._reset_amr_points()
-
-    @property
-    def npts(self) -> int:
-        return self._amr_coords.shape[1]
-
-    def reduce_set(self, ids: np.ndarray) -> None:
-        self._amr_coords = self._amr_coords[:, ids]
-        self._amr_sizes = self._amr_sizes[ids]
-        self._amr_ratios = self._amr_ratios[ids]
-        self._amr_new = self._amr_new[ids]
-
-    def _reset_amr_points(self) -> None:
-        for tag in self._amr_fields:
-            gmsh.model.mesh.field.remove(tag)
-        self._amr_fields = []
-
-    def add_refinement_points(
-        self, coords: np.ndarray, sizes: np.ndarray, ratios: np.ndarray
-    ):
-        if self._amr_coords is None:
-            self._amr_coords = coords
-        else:
-            self._amr_coords = np.hstack((self._amr_coords, coords))
-
-        if self._amr_sizes is None:
-            self._amr_sizes = sizes
-        else:
-            self._amr_sizes = np.hstack((self._amr_sizes, sizes))
-
-        if self._amr_ratios is None:
-            self._amr_ratios = ratios
-        else:
-            self._amr_ratios = np.hstack((self._amr_ratios, ratios))
-
-        if self._amr_new is None:
-            self._amr_new = np.ones_like(sizes)
-        else:
-            self._amr_new = np.hstack((0.0 * self._amr_new, np.ones_like(sizes)))
-
-    def set_refinement_function(self, gr: float = 1.5, _qf: float = 1.0):
-        xs = self._amr_coords[0, :]
-        ys = self._amr_coords[1, :]
-        zs = self._amr_coords[2, :]
-        newsize = self._amr_ratios * self._amr_sizes
-        A = newsize / gr
-        B = (1 - gr) / gr
-
-        from numba import njit, i8, f8
-
-        @njit(f8(i8, i8, f8, f8, f8, f8), nogil=True, fastmath=True, parallel=False)
-        def func(dim, tag, x, y, z, lc):
-            sizes = np.maximum(
-                newsize,
-                A - B * _qf * np.sqrt((x - xs) ** 2 + (y - ys) ** 2 + (z - zs) ** 2),
-            )
-            return min(lc, float(np.min(sizes)))
-
-        gmsh.model.mesh.setSizeCallback(func)
-
-    def set_ratio(self, ratio: float) -> None:
-        newids = self._amr_new == 1
-        self._amr_ratios[newids] = ratio
-        return self._amr_ratios[newids][0]
-
 
 class Mesher:
     def __init__(self):
+        """Manages the GMSH mesh size constraints and mesh generation of the model."""
         self.objects: list[GeoObject] = []
         self.size_definitions: list[tuple[int, float]] = []
         self.mesh_fields: list[int] = []
@@ -168,30 +96,33 @@ class Mesher:
 
         self._coarse_tags: list[int] = []
 
-        self._amr_fields: list[int] = []
-        self._amr_coords: np.ndarray = None
-        self._amr_sizes: np.ndarray = None
-        self._amr_ratios: np.ndrray = None
-        self._amr_new: np.ndarray = None
-        self._amrobj = AMRPoints()
+        # Wavelength-based size range set by set_frequency, in physical meters. Used as the default
+        # maximum size by the size helpers below, which convert it to modelling units (x self._scale).
         self.min_size: float = None
         self.max_size: float = None
         self.periodic_cell: PeriodicCell = None
 
+        self._scale: float = 1.0
+        self.global_max_size: float | None = None  # physical meters, see set_global_max_size
+
     @property
     def edge_tags(self) -> list[int]:
+        """The tags of all edges in the model."""
         return [tag[1] for tag in gmsh.model.getEntities(1)]
 
     @property
     def face_tags(self) -> list[int]:
+        """The tags of all faces in the model."""
         return [tag[1] for tag in gmsh.model.getEntities(2)]
 
     @property
     def node_tags(self) -> list[int]:
+        """The tags of all points in the model."""
         return [tag[1] for tag in gmsh.model.getEntities(0)]
 
     @property
     def volumes(self) -> list[GeoVolume]:
+        """All existing GeoVolume objects of the model."""
         return [
             obj for obj in self.objects if isinstance(obj, GeoVolume) and obj._exists
         ]
@@ -205,6 +136,7 @@ class Mesher:
 
     @property
     def domain_internal_face_tags(self) -> list[int]:
+        """The tags of all faces that are not on the outer boundary of the domains."""
         alltags = self.face_tags
         boundary = self.domain_boundary_face_tags
         return [tag for tag in alltags if tag not in boundary]
@@ -223,83 +155,39 @@ class Mesher:
                             to set the simulation frequency range before calling mesh instructions."
             )
 
-    def submit_objects(
-        self, objects: GeoObject | list[GeoObject] | list[list[GeoObject]]
-    ) -> None:
-        """Takes al ist of GeoObjects and computes the fragment.
-
-        Args:
-            objects (list[GeoObject]): The set of GeoObjects
-        """
-        if not isinstance(objects, list):
-            objects = [
-                objects,
-            ]
-
-        objects = unpack_lists(objects)
-        embeddings: list = []
-        gmsh.model.occ.synchronize()
-
-        final_dimtags = unpack_lists([domain.dimtags for domain in objects])  # type: ignore
-
-        dom_mapping = dict()
-        for dom in objects:  # type: ignore
-            embeddings.extend(dom._embeddings)  # type: ignore
-            for dt in dom.dimtags:  # type: ignore
-                dom_mapping[dt] = dom
-
-        embedding_dimtags = unpack_lists([emb.dimtags for emb in embeddings])
-
-        tag_mapping: dict[int, dict] = {0: dict(), 1: dict(), 2: dict(), 3: dict()}
-        if len(objects) > 0:  # type: ignore
-            dimtags, output_mapping = gmsh.model.occ.fragment(
-                final_dimtags, embedding_dimtags
-            )
-            for domain, mapping in zip(
-                final_dimtags + embedding_dimtags, output_mapping
-            ):
-                tag_mapping[domain[0]][domain[1]] = [o[1] for o in mapping]
-            for dom in objects:  # type: ignore
-                dom.update_tags(tag_mapping)  # type: ignore
-        else:
-            dimtags = final_dimtags
-
-        self.objects = objects  # type: ignore
-
-        gmsh.model.occ.synchronize()
-
     def _set_mesh_periodicity(
         self, face1: Selection, face2: Selection, lattice: np.ndarray
     ):
         translation = [
-            1,
-            0,
-            0,
-            lattice[0],
-            0,
-            1,
-            0,
-            lattice[1],
-            0,
-            0,
-            1,
-            lattice[2],
-            0,
-            0,
-            0,
-            1,
+            1,0,0,lattice[0],
+            0,1,0,lattice[1],
+            0,0,1,lattice[2],
+            0,0,0,1,
         ]
         gmsh.model.mesh.set_periodic(2, face2.tags, face1.tags, translation)
 
-    def set_algorithm(self, algorithm: Algorithm3D) -> None:
+    def set_algorithm(self, 
+                      algorithm: Algorithm3D,
+                      nthreads: int = 1) -> None:
 
-        gmsh.option.setNumber("General.NumThreads", 16)
+        """Set the GMSH 3D meshing algorithm.
+
+        Args:
+            algorithm (Algorithm3D): The meshing algorithm
+            nthreads (int): The number of threads to use (HXT only if installed correctly). Default to 1
+        """
+        gmsh.option.setNumber("General.NumThreads", nthreads)
         gmsh.option.setNumber("Mesh.Algorithm3D", algorithm.value)
 
     def set_periodic_cell(
         self, cell: PeriodicCell, excluded_faces: Selection | None = None
     ):
-        """Sets the periodic cell information based on the PeriodicCell class object"""
+        """Sets the periodic cell information based on the PeriodicCell class object
+
+        Args:
+            cell (PeriodicCell): The periodic cell
+            excluded_faces (Selection | None, optional): Faces to exclude from the periodic face pairs. Defaults to None.
+        """
         if excluded_faces is None:
             for f1, f2, lat in cell.cell_data():
                 self._set_mesh_periodicity(f1, f2, lat)
@@ -310,7 +198,7 @@ class Mesher:
                 )
         self.periodic_cell = cell
 
-    def _set_size_in_domain(self, tags: list[int], max_size: float) -> None:
+    def _set_size_in_domain(self, tags: list[int], max_size: float, set_max: bool = False) -> None:
         """Define the size of the mesh inside a domain
 
         Args:
@@ -320,7 +208,12 @@ class Mesher:
         ctag = gmsh.model.mesh.field.add("Constant")
         gmsh.model.mesh.field.set_numbers(ctag, "VolumesList", tags)
         gmsh.model.mesh.field.set_number(ctag, "VIn", max_size)
-        self.mesh_fields.append(ctag)
+        if not set_max:
+            self.mesh_fields.append(ctag)
+        else:
+            gmsh.model.mesh.field.set_number(ctag, "IncludeBoundary", 0)
+            gmsh.model.mesh.field.set_number(ctag, "VOut", 1e-9)
+            self.max_mesh_fields.append(ctag)
 
     def _set_size_on_face(
         self, tags: list[int], max_size: float, set_max: bool = False
@@ -353,11 +246,6 @@ class Mesher:
         gmsh.model.mesh.field.set_number(ctag, "VIn", max_size)
         self.mesh_fields.append(ctag)
 
-    def _reset_amr_points(self) -> None:
-        for tag in self._amr_fields:
-            gmsh.model.mesh.field.remove(tag)
-        self._amr_fields = []
-
     def _configure_bc_size(self, bcs: list[BoundaryCondition]) -> None:
         """Writes size constraints for the boundary conditions
 
@@ -370,6 +258,8 @@ class Mesher:
             if bc.dim != 2:
                 continue
             size = bc._size_constraint
+            if bc._size_constraint_is_physical:
+                size *= self._scale  # physical length -> modelling units
             logger.debug(
                 f"Setting size constraint for {bc} of size {size * 1000:.2f}mm"
             )
@@ -380,15 +270,22 @@ class Mesher:
         tag = gmsh.model.mesh.field.add("Max")
         maxval_tag = gmsh.model.mesh.field.add("MathEval")
         gmsh.model.mesh.field.setString(maxval_tag, "F", "100")
-        gmsh.model.mesh.field.setNumbers(
-            tag,
-            "FieldsList",
-            [
-                maxval_tag,
-            ],
-        )
+        gmsh.model.mesh.field.setNumbers(tag,"FieldsList",[maxval_tag,],)
         gmsh.model.mesh.field.setAsBackgroundMesh(tag)
         self._coarse_tags = (tag, maxval_tag)
+
+    def set_global_max_size(self, size: float | None) -> None:
+        """Sets an upper limit for the mesh element size everywhere in the model.
+
+        The size is a physical length in meters. It is multiplied by the model scale factor
+        (Simulation.set_scale_factor) internally. The wavelength-based default sizes can be much larger
+        than electrically small models (e.g. on-chip structures), in which case this limit is what
+        sets the mesh density away from small geometric features.
+
+        Args:
+            size (float | None): Maximum element size in meters. None removes the limit.
+        """
+        self.global_max_size = size
 
     def _configure_mesh_size(self, discretizer: Callable, resolution: float):
         """Defines the mesh sizes based on a discretization callable.
@@ -405,6 +302,14 @@ class Mesher:
             "Mesh.MeshSizeFromCurvature", self.curved_boundary_segments
         )
 
+        # Global upper limit on every element (gmsh default 1e22 = no limit). Always set, so a limit
+        # from a previous model does not leak into this one through gmsh's global options.
+        if self.global_max_size is not None:
+            gmsh.option.setNumber("Mesh.MeshSizeMax", self.global_max_size * self._scale)
+            logger.info(f"Global maximum mesh size: {self.global_max_size * 1e6:.3g} um (physical)")
+        else:
+            gmsh.option.setNumber("Mesh.MeshSizeMax", 1e22)
+
         for tag in self._coarse_tags:
             gmsh.model.mesh.field.remove(tag)
             self._coarse_tags = []
@@ -418,7 +323,9 @@ class Mesher:
         size_mapping = dict()
 
         for obj in self.objects:
-            if obj.dim != 2 and obj.max_meshsize < 1e9:
+            if obj.dim != 2:
+                continue
+            if obj.max_meshsize <= 1e9:
                 continue
             self._set_size_on_face(obj.tags, obj.max_meshsize)
 
@@ -428,35 +335,27 @@ class Mesher:
             if obj._unset_constraints:
                 self.unset_constraints(obj.dimtags)
 
-            size = discretizer(obj.material) * resolution * obj.mesh_multiplier
+            size = self._scale*discretizer(obj.material) * resolution * obj.mesh_multiplier
             size = min(size, obj.max_meshsize)
+            if self.global_max_size is not None:
+                size = min(size, self.global_max_size * self._scale)
 
             for dimtag in obj.dimtags:
                 size_mapping[dimtag] = size
 
         for (dim, tag), size in size_mapping.items():
-            size = min(size, obj.max_meshsize)
+            
             if dim == 2:
                 logger.debug(
                     f"Somehow setting mesh size:{1000 * size:.3f}mm on boundary: {tag}"
                 )
-                self._set_size_on_face(
-                    [
-                        tag,
-                    ],
-                    size,
-                )
+                self._set_size_on_face([tag,],size,)
             if dim == 3:
                 logger.debug(f"Setting mesh size:{1000 * size:.3f}mm in domains: {tag}")
-                self._set_size_in_domain(
-                    [
-                        tag,
-                    ],
-                    size,
-                )
+                self._set_size_in_domain([tag,],size,)
 
         gmsh.model.mesh.field.setNumbers(
-            mintag, "FieldsList", self.mesh_fields + self._amr_fields
+            mintag, "FieldsList", self.mesh_fields
         )
 
         if len(self.max_mesh_fields) > 0:
@@ -465,9 +364,7 @@ class Mesher:
                 maxtag,
                 "FieldsList",
                 self.max_mesh_fields
-                + [
-                    mintag,
-                ],
+                + [mintag,],
             )
             gmsh.model.mesh.field.setAsBackgroundMesh(maxtag)
         else:
@@ -477,12 +374,7 @@ class Mesher:
             logger.debug(
                 f"Setting aux size definition: {1000 * size:.3f}mm in domain {tag}."
             )
-            gmsh.model.mesh.setSize(
-                [
-                    tag,
-                ],
-                size,
-            )
+            gmsh.model.mesh.setSize([tag,],size,)
 
     def _fix_curved_boundary_meshing(self) -> None:
         """Fix the meshing on curved boundaries by setting a finer mesh on edges"""
@@ -497,78 +389,15 @@ class Mesher:
         self.curved_boundary_segments = factor
 
     def unset_constraints(self, dimtags: list[tuple[int, int]]):
-        """Unset the mesh constraints for the given dimension tags."""
+        """Unset the mesh constraints for the given dimension tags.
+
+        Args:
+            dimtags (list[tuple[int, int]]): The (dim, tag) pairs
+        """
         logger.trace(f"Unsetting mesh size constraint for domains: {dimtags}")
         for dimtag in dimtags:
             gmsh.model.mesh.setSizeFromBoundary(dimtag[0], dimtag[1], 0)
 
-    def add_refinement_points(
-        self, coords: np.ndarray, sizes: np.ndarray, ratios: np.ndarray
-    ):
-        if self._amr_coords is None:
-            self._amr_coords = coords
-        else:
-            self._amr_coords = np.hstack((self._amr_coords, coords))
-
-        if self._amr_sizes is None:
-            self._amr_sizes = sizes
-        else:
-            self._amr_sizes = np.hstack((self._amr_sizes, sizes))
-
-        if self._amr_ratios is None:
-            self._amr_ratios = ratios
-        else:
-            self._amr_ratios = np.hstack((self._amr_ratios, ratios))
-
-        if self._amr_new is None:
-            self._amr_new = np.ones_like(sizes)
-        else:
-            self._amr_new = np.hstack((0.0 * self._amr_new, np.ones_like(sizes)))
-
-    def _set_refinement_function(self, gr: float = 1.5, _qf: float = 1.0):
-        """Define the refinement function based on AMR points. Not to be used by you.
-
-        Args:
-            gr (float, optional): The growth ratio . Defaults to 1.5.
-            _qf (float, optional): The growth ratio scale factor. Defaults to 1.0.
-
-        """
-        xs = self._amr_coords[0, :]
-        ys = self._amr_coords[1, :]
-        zs = self._amr_coords[2, :]
-        newsize = self._amr_ratios * self._amr_sizes
-        A = newsize / gr
-        B = (1 - gr) / gr
-        from numba import njit, i8, f8
-
-        @njit(f8(i8, i8, f8, f8, f8, f8), nogil=True, fastmath=True, parallel=False)
-        def func(dim, tag, x, y, z, lc):
-            sizes = np.maximum(
-                newsize,
-                A
-                - B
-                * _qf
-                * np.clip(
-                    np.sqrt((x - xs) ** 2 + (y - ys) ** 2 + (z - zs) ** 2)
-                    - newsize * 0,
-                    a_min=0,
-                    a_max=None,
-                ),
-            )
-            return min(lc, float(np.min(sizes)))
-
-        gmsh.model.mesh.setSizeCallback(func)
-
-    def _set_refinement_ratio(self, ratio: float) -> None:
-        """Update the adaptive mesh refinement ratio. Not to be used by users.
-
-        Args:
-            ratio (float): The new refinement ratio
-
-        """
-        newids = self._amr_new == 1
-        self._amr_ratios[newids] = ratio
-        return self._amr_ratios[newids][0]
 
     def set_boundary_size(
         self,
@@ -582,7 +411,7 @@ class Mesher:
         The growth rate determines how quickly the mesh size is allowed to increase away from the face boundary.
 
         Args:
-            boundary (GeoSurface | FaceSelection | Iterable): The boundary/surface object to refine the mesh on
+            boundary (GeoObject | Selection | Iterable): The boundary/surface object to refine the mesh on
             size (float): The mesh size limit in meters
             growth_rate (float, optional): The mesh growth rate. Defaults to 3.
             max_size (float, optional): The maximum mesh size. Defaults to None.
@@ -596,7 +425,7 @@ class Mesher:
 
         if max_size is None:
             self._check_ready()
-            max_size = self.max_size
+            max_size = self.max_size * self._scale  # physical -> modelling units
 
         growth_distance = (growth_rate * max_size - size) / (growth_rate - 1)
         logger.debug(
@@ -616,7 +445,10 @@ class Mesher:
             gmsh.model.mesh.field.setNumbers(
                 disttag, "SurfacesList", [n[1] for n in nodes]
             )
-        gmsh.model.mesh.field.setNumber(disttag, "Sampling", 100)
+        if boundary.dim == 2:
+            gmsh.model.mesh.field.setNumber(disttag, "Sampling", _curve_sampling([n[1] for n in nodes], size))
+        else:
+            gmsh.model.mesh.field.setNumber(disttag, "Sampling", 100)
 
         thtag = gmsh.model.mesh.field.add("Threshold")
         gmsh.model.mesh.field.setNumber(thtag, "InField", disttag)
@@ -648,7 +480,8 @@ class Mesher:
             growth_rate (float, optional): How quickly the mesh size is allowed to grow. Defaults to 3.0.
             min_size (float, optional): The minimum size of the mesh in meters. Defaults to 1e-5.
             max_size (float | None, optional): The maximum size to constrain to. Defaults to None.
-            min_overlap (float | optional): The minimum overlap for two edges to be refined. Defaults to 0.75 = 75%
+            edge_size (float | None, optional): If given, an additional boundary mesh size constraint on the trace edges. Defaults to None.
+            min_overlap (float, optional): The minimum overlap for two edges to be refined. Defaults to 0.75 = 75%
 
         Raises:
             MeshError: _description_
@@ -657,7 +490,7 @@ class Mesher:
 
         if max_size is None:
             self._check_ready()
-            max_size = self.max_size
+            max_size = self.max_size * self._scale  # physical -> modelling units
 
         if isinstance(obj, Iterable):
             from .geometry import select
@@ -669,14 +502,10 @@ class Mesher:
                 'Can only do trace refinement for 2D structures. In case of thick metal traces, use the bottom layer with .face("-z")'
             )
 
-        edge_dimtags = gmsh.model.get_boundary(obj.dimtags, True)
+        edge_dimtags = gmsh.model.get_boundary(obj.dimtags, True, False)
         edges = [t for d, t in edge_dimtags if d == 1]
         edge_nodes: dict[int, tuple[int, int]] = {
-            tag: gmsh.model.get_boundary(
-                [
-                    (1, tag),
-                ]
-            )
+            tag: gmsh.model.get_boundary([(1, tag),],True, False,False)
             for tag in edges
         }
 
@@ -732,7 +561,7 @@ class Mesher:
                     edge_tag,
                 ],
             )
-            gmsh.model.mesh.field.setNumber(disttag, "Sampling", 100)
+            gmsh.model.mesh.field.setNumber(disttag, "Sampling", _curve_sampling([edge_tag], size))
 
             thtag = gmsh.model.mesh.field.add("Threshold")
             gmsh.model.mesh.field.setNumber(thtag, "InField", disttag)
@@ -746,7 +575,7 @@ class Mesher:
         """Manually set the maximum element size inside a domain
 
         Args:
-            obj (GeoVolume | Selection): The volumetric domain
+            obj (GeoObject | Selection): The volumetric domain
             size (float): The maximum mesh size
         """
         if obj.dim != 3:
@@ -783,15 +612,28 @@ class Mesher:
             size (float): The maximum size
         """
         if size < 0:
-            size = self.max_size
+            size = self.max_size * self._scale  # physical -> modelling units
         if obj.dim != 2:
-            logger.warning("Provided object is not a surface.")
-            if obj.dim == 3:
-                logger.warning("Forwarding to set_domain_size")
-                self.set_face_size(obj, size)
+            raise MeshError("Provided object is not a surface.")
 
+            
         logger.debug(f"Setting PEC size {size * 1000:.3f}mm for face {obj}")
         self._set_size_on_face(obj.tags, size, True)
+
+    def set_pec_domain(self, obj: GeoObject | Selection, size: float = -1) -> None:
+            """Sets the size on PEC faces to be very coarse to save computational time.
+    
+            Args:
+                obj (GeoObject | Selection): The volumetric domain
+                size (float): The maximum size
+            """
+            if size < 0:
+                size = self.max_size * self._scale  # physical -> modelling units
+            if obj.dim != 3:
+                raise MeshError("Provided object is not a domain.")
+    
+            logger.debug(f"Setting PEC size {size * 1000:.3f}mm for face {obj}")
+            self._set_size_in_domain(obj.tags, size, True)
 
     def set_size(self, obj: GeoObject, size: float) -> None:
         """Manually set the size in or on an object
@@ -810,7 +652,16 @@ class Mesher:
             self._set_size_on_point(obj.tags, size)
 
     def refine_conductor_edge(self, dimtags: list[tuple[int, int]], size):
-        nodes = gmsh.model.getBoundary(dimtags, combined=False, recursive=False)
+        """Refine the mesh near the edges of conductor surfaces.
+
+        The mesh size is limited to size up to 0.2 size away from the edges and grows to the
+        global size at 5 size away.
+
+        Args:
+            dimtags (list[tuple[int, int]]): The (dim, tag) pairs of the conductor surfaces
+            size (float): The mesh size at the edges
+        """
+        nodes = gmsh.model.getBoundary(dimtags, combined=False, oriented=False, recursive=False)
 
         # for node in nodes:
         #     pcoords = np.linspace(0, 0.5, 10)
@@ -822,7 +673,7 @@ class Mesher:
 
         # gmsh.model.mesh.field.setNumbers(1, "PointsList", [5])
         gmsh.model.mesh.field.setNumbers(tag, "CurvesList", [n[1] for n in nodes])
-        gmsh.model.mesh.field.setNumber(tag, "Sampling", 100)
+        gmsh.model.mesh.field.setNumber(tag, "Sampling", _curve_sampling([n[1] for n in nodes], size))
 
         # We then define a `Threshold' field, which uses the return value of the
         # `Distance' field 1 in order to define a simple change in element size
@@ -846,3 +697,5 @@ class Mesher:
 
         for dimtag in dimtags:
             gmsh.model.mesh.setSizeFromBoundary(dimtag[0], dimtag[1], 0)
+
+    

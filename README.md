@@ -1,160 +1,238 @@
+<div align="center">
+
+![LinkedInCover](https://github.com/user-attachments/assets/09142f09-8718-4943-a60a-7593ca738759)
+
 ![GitHub License](https://img.shields.io/github/license/FennisRobert/EMerge)
 ![GitHub Release](https://img.shields.io/github/v/release/FennisRobert/EMerge)
 ![PyPI - Downloads](https://img.shields.io/pypi/dw/emerge)
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.17025518-blue)](https://doi.org/10.5281/zenodo.17025518)
 
+</div>
+
 ## Introduction
-![LinkedInCover](https://github.com/user-attachments/assets/09142f09-8718-4943-a60a-7593ca738759)
-
-
-Hello everybody. Thanks for showing interest in my EM FEM library!
 
 EMerge is a python based FEM EM library for the time harmonic helmholtz formulation. It is thus best suited for
 Electromagnetic wave phenomenon. You can use it to simulate:
- - RF Filters
- - Signal propagation through PCBs
- - Antennas
- - Optycal systems
- - Arrays and periodic structures
- - Much more!
 
-It is designed to be as easy to use and compatible as possible. It runs on all operating systems allthough some solvers
-are a bit harder to make work on some systems than others.
+- RF Filters
+- Signal propagation through PCBs
+- Antennas
+- Optycal systems
+- Arrays and periodic structures
+- Much more!
+
+It is designed to be as easy to use and compatible as possible. It runs on all operating systems and on all hardware.
 
 EMerge is designed to have your entire simulation start and finish in the same Python script (or more if you want).
 You require no awkward configuration files, JSON's, external software to do modelling etc. It allows you to do everything
 in Python:
- * Geometry Creation/description
- * Material assignment
- * Meshing + mesh settings and adaptive mesh refinement
- * Boundary condition setup
- * Solving
- * Post processing and visualization
 
-If you have questions, suggestions, bug reports or just want to hang out, feel free to join the discord!
+- Geometry Creation/description |
+- Material assignment |
+- Meshing + mesh settings and adaptive mesh refinement |
+- Boundary condition setup |
+- Solving |
+- Post processing and visualization |
 
-**[Discord Invitation](https://discord.gg/VMftDCZcNz)**
+> If you have questions, suggestions, bug reports or just want to hang out, feel free to join the discord!
+>
+> **[Discord Invitation](https://discord.gg/VMftDCZcNz)**
+
+---
 
 ## How to install
 
 You can now install the basic version of emerge from PyPi!
 
-```
+```bash
 pip install emerge
 ```
 
+---
+
 ## Direct solvers
-EMerge solves all systems with direct solvers only. Some are faster than others. Depending on the operating 
-system and hardware you have, some might work better and/or are easier to install than others.
 
-### MacOS (ARM)
-It is advised to use the Apple Accelerate sparse solver for all cases. On all versions before 2.5.3 install through
+EMerge solves all systems with direct solvers only. Some are faster than others. Depending on the operating
+system and hardware you have, some might work better and/or are easier to install than others. EMerge picks a
+solver automatically; `em.solvers.available()` lists the solvers installed on your system and
+`model.set_solver(em.solvers.Sparta)` selects one yourself.
 
-```
-pip install https://github.com/FennisRobert/emerge-aasds@v0.2.0
-```
+### SPARTA (recommended)
 
-By default the Accelrate solver will be limited to a single thread for frequency distributed sweeps. To allow for more threads either set the environment variable manually:
-```
-VECLIB_MAXIMUM_THREADS = 4
-```
-Or in Python before loading EMerge:
+SPARTA is the open source sparse direct solver made for EMerge, and its recommended solver. It is the fastest CPU
+solver for EMerge, and it can also run on the GPU: Apple silicon (Metal) and AMD (Vulkan).
+
+SPARTA is installed with EMerge on macOS, Windows (x86-64) and Linux (x86-64 and ARM64). On other platforms it is
+skipped and EMerge uses its other solvers. Once installed, EMerge uses SPARTA on the CPU for every sweep (before
+3.0.8 PARDISO was preferred where available). To run SPARTA on the GPU, set:
+
 ```python
-import os
-os.environ['VECLIB_MAXIMUM_THREADS'] = '4'
+model.set_device("GPU")     # or "HYBRID" for a combined GPU + CPU factorization
 ```
-Of from 2.5.3 onwards also through the config sister module
+
+If you run into a problem with SPARTA, EMerge works without it:
+
+- set the environment variable `EMERGE_DISABLE_SPARTA=1` to run EMerge as if SPARTA were not installed, or
+- remove it with `pip uninstall sparta-solver`.
+
+Please report the problem at the [SPARTA issues](https://github.com/FennisRobert/SPARTA/issues).
+
+### Threads
+
+Set the number of CPU threads with:
+
+```python
+em.set_threads(4)
+```
+
+This applies to EMerge's compiled kernels (assembly, interpolation, far fields) and is the default thread count of
+the solvers that support one (SPARTA, PARDISO). A run method can override it for the solver, for example
+`model.mw.run_sweep(nthreads=4)`.
+
+Settings that native libraries read when they load (the Accelerate, RSLab and MUMPS threads) must be set before
+importing EMerge. The `emerge_config` module, installed with EMerge, does that:
+
 ```python
 from emerge_config import config
-config.set_acc_threads(4)
+config.set_acc_threads(4)   # Apple Accelerate
+import emerge as em
 ```
 
-#### Single threaded UMFPACK
-There is also an UMFPACK interface but it is more difficult to install and not as fast as the Accelerate solver.
-```
-brew install cmake swig suite-sparse pkg-config #MacOS
-sudo apt-get install libsuitesparse-dev #Linux
-```
-Then on MacOS do:
-```
-export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:$PKG_CONFIG_PATH"
-export CFLAGS="-I/opt/homebrew/include"
-export LDFLAGS="-L/opt/homebrew/lib"
-export CFLAGS="-Wno-error=int-conversion"
-```
-Finally:
-```
-pip install meson-python ninja
-pip install --no-build-isolation --no-binary=scikit-umfpack scikit-umfpack
+### Other solvers
+
+<details open>
+<summary><b>MacOS (ARM)</b></summary>
+
+<br>
+
+Without SPARTA, EMerge uses the Apple Accelerate sparse solver. From 3.0 onwards it is installed automatically
+with EMerge on macOS (the precompiled `emerge-aasds` package on PyPI), so no extra installation is needed.
+
+The Accelerate solver does not take a thread count from `em.set_threads()`. EMerge limits it to a single thread
+for frequency distributed sweeps. To allow more threads, use the `emerge_config` module before importing EMerge:
+
+```python
+from emerge_config import config
+config.set_acc_threads(4)   # before importing emerge
+import emerge as em
 ```
 
-**note**: If you have any corrections to these instructions (for any os) please let me know!
+</details>
 
-#### Multi threaded MUMPS
-To install the MUMPS solver on MacOS, download the installer directory from my website and follow the instructions. Please note that Accelerate is also faster than MUMPS in multi-core performance.
+<details open>
+<summary><b>Windows (x86)</b></summary>
 
-https://www.emerge-software.com/resources
+<br>
 
-### Windows (x86)
 Windows has easy access to the lightning fast PARDISO solver out of the box, no installation needed.
-If you want to install the UMFPACK solver for distributed sweeps this distribution should work through conda forge:
+
+</details>
+
+<details open>
+<summary><b>GPU based CuDSS solver</b></summary>
+
+<br>
+
+If you have a new NVidia card you can try the first test implementation of the cuDSS solver. The dependencies can be installed through:
+
+```bash
+pip install emerge[cudss]
+```
+
+To use the GPU, set:
+
+```python
+model.set_device("GPU")
+```
+
+</details>
+
+<details>
+<summary><b>Legacy solvers</b></summary>
+
+<br>
+
+UMFPACK is still supported but is slow compared to the solvers above, so it is only used when none of them is
+available. If you want it anyway, it installs through conda forge:
 
 ```bash
 conda install conda-forge::scikit-umfpack
 ```
 
-Otherwise try the solution in the user manual.
+</details>
 
-https://www.emerge-software.com/resources
+---
 
-### GPU bsed CuDSS solver
-If you have a new NVidia card you can try the first test implementation of the cuDSS solver. The dependencies can be installed through:
+## Install GMSH Version 5.0.0 MacOS
+
+```bash
+pip install https://gmsh.info/python-packages-dev/gmsh/gmsh-5.0.0.dev1-py2.py3-none-macosx_12_0_arm64.whl --force-reinstall
 ```
-pip install emerge[cudss]
+
+---
+
+## Dependencies
+
+
+> EMerge ships compiled Rust kernels (the `emr` module, source in `emr/`). PyPI wheels include them; installing from source
+> (`pip install /path/to/EMerge` or `pip install git+https://github.com/FennisRobert/EMerge.git`) compiles them automatically
+> and requires a Rust toolchain (https://rustup.rs).
+
+`pip install emerge` installs the required libraries automatically; you don't need to install them yourself.
+The optional extras are only installed when you ask for them.
+
+<table>
+<tr>
+<th align="left">Installed automatically</th>
+<th align="left">Optional extras</th>
+</tr>
+<tr>
+<td valign="top">
+
+- numpy
+- scipy
+- gmsh
+- loguru
+- matplotlib (for the matplotlib base display)
+- pyvista (for the PyVista base display)
+- joblib
+- msgpack, msgpack-numpy
+- psutil
+- emsutil
+- mkl (x86 devices only)
+- emerge-aasds (macOS only, the Apple Accelerate solver)
+
+</td>
+<td valign="top">
+
+Installed with `pip install emerge[<extra>]`:
+
+- `cudss`: the NVIDIA cuDSS GPU solver
+- `dxf`: ezdxf
+- `cad`: emcad and pygerber (Gerber and ODB++)
+- `spyder`: trame-pyvista, nest_asyncio2, ipywidgets
+- `umfpack`: scikit-umfpack (legacy)
+
+Installed separately:
+
+- SPARTA (recommended, see [SPARTA](#sparta-recommended))
+
+</td>
+</tr>
+</table>
+
+---
+
+## PCB and CAD readers
+
+You can read Gerber and ODB++ files using the optional `emcad` dependency which I also maintain. To get all the dependencies its easiest to do:
+
+```bash
+pip install emerge[cad]
 ```
-*Limitations: * Cupy is currently only supporting 32 bit integer address so large EM problems cannot be correctly solved currently. This is not something I can do anything about.*
 
-## Required libraries
-
-To run this FEM library you need the following libraries
-
- - numpy
- - scipy
- - gmsh
- - loguru
- - numba
- - matplotlib (for the matplotlib base display)
- - pyvista (for the PyVista base display)
- - mkl (x86 devices only)
- - emsutil
- - 
-Optional:
- - scikit-umfpack
- - cudss
- - ezdxf
+---
 
 ## Resources / Manual
 
 You can find the latest versions of the manual on: **https://www.emerge-software.com/resources/**
-
-## Generative AI Policy
-In this project, generative AI and LLM based AI tools are used for coding assistance, writing of code for quick tests and sometimes the implementations of functions.
-
-This project does not or rarely uses functions that are completely written by generative AI.
-
-This project does not accept completely vibe coded functionality without human supervision, interpretation and validation.
-
-Because the repository has one active developer with multiple personal computers, the commit history is used to transfer code between computers that is not finished. The commit history may therefore contain code that is AI generated during development phases after which it is usually refactored/rewritten.
-
-Some small trivial functions may be copied from LLM output but these are often so trivial that they are not copyrightable anyway. Examples are hard coded matrix multiplication for Numba compiled functions:
-(this function is coincidentally not generated by LLM's but such functions might have been.)
-```python
-# Example of a function that could have been but in this case is not written by AI models.
-@njit(f8[:, :](f8[:, :], f8[:, :]), cache=True, nogil=True)
-def matmul(a, b):
-    out = np.empty((3, b.shape[1]), dtype=np.float64)
-    out[0, :] = a[0, 0] * b[0, :] + a[0, 1] * b[1, :] + a[0, 2] * b[2, :]
-    out[1, :] = a[1, 0] * b[0, :] + a[1, 1] * b[1, :] + a[1, 2] * b[2, :]
-    out[2, :] = a[2, 0] * b[0, :] + a[2, 1] * b[1, :] + a[2, 2] * b[2, :]
-    return out
-```

@@ -28,7 +28,7 @@ from .dofsets import DoFSet
 ## TODO: TEMPORARY SOLUTION FIX THIS
 
 
-class FieldFunctionClass:
+class FieldFunctionClass(Saveable):
     """This Class serves as a picklable class so that ModalPort boundary conditions
     can actually be stored with the Simulation class. Functions aren't picklable in
     Python.
@@ -68,7 +68,7 @@ class FieldFunctionClass:
 
         if EH == "H":
             if diadic is None:
-                self.diadic = np.eye(3)[:, :, np.newaxis()] * np.ones(
+                self.diadic = np.eye(3)[:, :, np.newaxis] * np.ones(
                     (self.tris.shape[1])
                 )  # type: ignore
 
@@ -224,7 +224,7 @@ class FieldFunctionClass:
         Exy = self.calcExy(xs, ys, zs)
         gEzxy = self.calcEzGrad(xs, ys, zs)
         gamma_m = 1j * self.beta
-        field = gamma_m * Exy - gEzxy
+        field = gamma_m * Exy + gEzxy
         return field
 
     def calcH_loc(
@@ -319,8 +319,6 @@ class NedelecLegrange2(FEMBasis, Saveable):
         
         ##
         self._field: np.ndarray = None
-        self._rows: np.ndarray = None
-        self._cols: np.ndarray = None
 
     def __call__(self, **kwargs) -> NedelecLegrange2:
         self._field = self.fielddata(**kwargs)
@@ -335,14 +333,27 @@ class NedelecLegrange2(FEMBasis, Saveable):
     def interpolate_Hf(
         self, field: np.ndarray, k0: float, ur: np.ndarray, beta: float
     ) -> FieldFunctionClass:
-        """Generates the Interpolation function as a function object for a given coordiante basis and origin."""
-        from ..mth.optimized import matinv
+        """Generates the H-field interpolation function H = j/(ω μ0) μr^-1 ∇×E of a mode with e^(-jβz) dependence.
+
+        Args:
+            field: The mode field coefficients (transverse E and the physical E_z).
+            k0: The free space wave number.
+            ur: (3, 3, n_tris) relative permeability tensors in global coordinates, one per triangle of this
+                field's surface mesh (in the same order as self.mesh.tris).
+            beta: The propagation constant.
+        """
+        from emr.mth import matinv
+
+        if ur.shape[2] != self.n_tris:
+            raise ValueError(f"Expected one permeability tensor per port triangle ({self.n_tris}), got {ur.shape[2]}.")
 
         constant = 1j / ((k0 * C0) * MU0)
+        # The curl is evaluated in local port coordinates, so the tensor is transformed into the local frame.
+        basis, basis_inv = self.cs._basis, self.cs._basis_inv
         urinv = np.zeros_like(ur)
 
         for i in range(ur.shape[2]):
-            urinv[:, :, i] = matinv(ur[:, :, i])
+            urinv[:, :, i] = basis_inv @ matinv(ur[:, :, i]) @ basis
 
         return FieldFunctionClass(
             field,
@@ -356,43 +367,3 @@ class NedelecLegrange2(FEMBasis, Saveable):
             constant,
             dofcodes=self.dofcodes
         )
-
-    # def tri_interpolate(
-    #     self, field, xs: np.ndarray, ys: np.ndarray, usenan: bool = False
-    # ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    #     from .ned2_interp import ned2_tri_interp_full
-
-    #     coordinates = np.array([xs, ys])
-    #     vals = ned2_tri_interp_full(
-    #         coordinates, field, self.mesh.tris, self.local_nodes, self.tri_to_field
-    #     )
-    #     if not usenan:
-    #         vals = np.nan_to_num(vals)
-    #     return vals
-
-    # def tri_interpolate_curl(
-    #     self,
-    #     field,
-    #     xs: np.ndarray,
-    #     ys: np.ndarray,
-    #     diadic: np.ndarray | None = None,
-    #     beta: float = 0.0,
-    #     usenan: bool = False,
-    # ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    #     from .ned2_interp import ned2_tri_interp_curl
-
-    #     coordinates = np.array([xs, ys])
-    #     if diadic is None:
-    #         diadic = np.eye(3)[:, :, np.newaxis()] * np.ones((self.mesh.n_tris))  # type: ignore
-    #     vals = ned2_tri_interp_curl(
-    #         coordinates,
-    #         field,
-    #         self.mesh.tris,
-    #         self.local_nodes,
-    #         self.tri_to_field,
-    #         diadic,
-    #         beta,
-    #     )
-    #     if not usenan:
-    #         vals = np.nan_to_num(vals)
-    #     return vals

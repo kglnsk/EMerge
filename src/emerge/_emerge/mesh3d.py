@@ -17,14 +17,15 @@
 
 # Last Cleanup: 2026-03-04
 from __future__ import annotations
+from ._global import _GlobalHandler
 import gmsh  # type: ignore
 import numpy as np
 from typing import Union, List, Tuple, Callable, Any
 from collections import defaultdict
 from loguru import logger
 from .bc import Periodic
-from .logsettings import DEBUG_COLLECTOR
 from emsutil import Saveable
+from emr import mesh3d as _emr_mesh
 
 _MISSING_ID: int = -1234
 
@@ -74,23 +75,41 @@ def tri_ordering(i1: int, i2: int, i3: int) -> int:
     return np.sign(np.sign(i2 - 1) + np.sign(i3 - i2) + np.sign(i1 - i3))
 
 
-def _map_array_by_dict(arr: np.ndarray, mapping: dict[int, int]) -> np.ndarray:
-    """Convertes a numpy array of integers by a dictionary from int to int
+def _tet_volumes(nodes: np.ndarray, tets: np.ndarray) -> np.ndarray:
+    """Volumes of the tetrahedra tets (4, N) with vertex coordinates nodes (3, M)."""
+    x1, x2, x3, x4 = (nodes[:, tets[i, :]] for i in range(4))
+    a, b, c = x1 - x4, x2 - x4, x3 - x4
+    vol = (
+        a[0] * (b[1] * c[2] - b[2] * c[1])
+        - a[1] * (b[0] * c[2] - b[2] * c[0])
+        + a[2] * (b[0] * c[1] - b[1] * c[0])
+    )
+    return np.abs(vol) / 6.0
 
-    Args:
-        arr (np.ndarray): _description_
-        mapping (dict[int, int]): _description_
 
-    Returns:
-        np.ndarray: _description_
-    """
-    keys = np.array(list(mapping.keys()))
-    vals = np.array(list(mapping.values()))
-    sort_idx = np.argsort(keys)
-    keys, vals = keys[sort_idx], vals[sort_idx]
+def _tri_areas(nodes: np.ndarray, tris: np.ndarray) -> np.ndarray:
+    """Areas of the triangles tris (3, N) with vertex coordinates nodes (3, M)."""
+    x1, x2, x3 = (nodes[:, tris[i, :]] for i in range(3))
+    e1, e2 = x2 - x1, x3 - x1
+    av = np.array((
+        e1[1] * e2[2] - e1[2] * e2[1],
+        e1[2] * e2[0] - e1[0] * e2[2],
+        e1[0] * e2[1] - e1[1] * e2[0],
+    ))
+    return np.sqrt(av[0] ** 2 + av[1] ** 2 + av[2] ** 2) / 2
 
-    idx = np.searchsorted(keys, arr)
-    return vals[idx]
+
+def _dict_lookup(mapping: dict[int, int]) -> Callable[[np.ndarray], np.ndarray]:
+    """Returns a vectorized function that maps an integer array through the dictionary mapping."""
+    keys = np.fromiter(mapping.keys(), dtype=np.int64, count=len(mapping))
+    vals = np.fromiter(mapping.values(), dtype=np.int64, count=len(mapping))
+    order = np.argsort(keys)
+    keys, vals = keys[order], vals[order]
+
+    def lookup(arr) -> np.ndarray:
+        return vals[np.searchsorted(keys, np.asarray(arr, dtype=np.int64))]
+
+    return lookup
 
 
 class Mesh:
@@ -122,37 +141,26 @@ class Mesh3D(Mesh, Saveable):
 
     def __init__(self):
 
-        # Because GMSH associates "tags" with each entity, in EMerge we link GMSH tag numbers with EMerge entiti indices in t2i and i2t notation.
+        # GMSH tags of mesh entities are only needed while building the mesh (_pre_update) and are not stored.
+        # Lookups by vertex indices (get_edge, get_tri, get_tet) search the index arrays instead of keeping
+        # dictionaries, which cost several hundred bytes per entity.
 
         # All spatial objects
         self.nodes: np.ndarray = np.array([])
-        self.n_i2t: dict = dict()
-        self.n_t2i: dict = dict()
 
         # tets colletions
         self.tets: np.ndarray = np.array([])
-        self.tet_i2t: dict = dict()
-        self.tet_t2i: dict = dict()
         self.centers: np.ndarray = np.array([])
 
         # triangles
         self.tris: np.ndarray = np.array([])
-        self.tri_i2t: dict = dict()
-        self.tri_t2i: dict = dict()
         self.areas: np.ndarray = np.array([])
         self.tri_centers: np.ndarray = np.array([])
 
         # edges
         self.edges: np.ndarray = np.array([])
-        self.edge_i2t: dict = dict()
-        self.edge_t2i: dict = dict()
         self.edge_centers: np.ndarray = np.array([])
         self.edge_lengths: np.ndarray = np.array([])
-
-        # Inverse mappings
-        self.inv_edges: dict = dict()
-        self.inv_tris: dict = dict()
-        self.inv_tets: dict = dict()
 
         # Mappings
 
@@ -163,8 +171,6 @@ class Mesh3D(Mesh, Saveable):
         self.tet_to_tri: np.ndarray = np.array([])
         self.tri_to_tet: np.ndarray = np.array([])
         self.tri_to_edge: np.ndarray = np.array([])
-        self.edge_to_tri: defaultdict | dict = defaultdict()
-        self.node_to_edge: defaultdict | dict = defaultdict()
 
         # Physics mappings
         # TODO: These should be removable.
@@ -187,7 +193,6 @@ class Mesh3D(Mesh, Saveable):
         # These quantities link more abstract geometric entities such as boxes/faces etc to their
         # respective triangles, nodes etc. They link GMSH tags to mesh indices
         self.ftag_to_tri: dict[int, list[int]] = dict()
-        self.ftag_to_node: dict[int, list[int]] = dict()
         self.ftag_to_edge: dict[int, list[int]] = dict()
         self.vtag_to_tet: dict[int, list[int]] = dict()
         self.etag_to_edge: dict[int, list[int]] = dict()
@@ -227,12 +232,29 @@ class Mesh3D(Mesh, Saveable):
         """Return the number of nodes"""
         return self.nodes.shape[1]
 
+    @property
+    def ftag_to_node(self) -> dict[int, list[int]]:
+        """[Written by Claude] The node indices of every face tag, derived from ftag_to_tri (not stored)."""
+        return {
+            tag: np.unique(self.tris[:, np.asarray(tris, dtype=np.int64)]).tolist()
+            for tag, tris in self.ftag_to_tri.items()
+        }
+
+    @ftag_to_node.setter
+    def ftag_to_node(self, value) -> None:
+        """Ignored: files saved before ftag_to_node was derived still restore it."""
+
+    @staticmethod
+    def _find(table: np.ndarray, *ids) -> int:
+        """[Written by Claude] Column of table holding the vertex set ids, or _MISSING_ID."""
+        query = np.array([[int(i)] for i in ids], dtype=np.int64)
+        return int(_emr_mesh.find_columns(np.ascontiguousarray(table, dtype=np.int64), query)[0])
+
     def get_edge(self, i1: int, i2: int, skip: bool = False) -> int:
         """Return the edge index given the two node indices"""
         if i1 == i2:
             raise MeshException("Edge cannot be formed by the same node.")
-        search = (min(int(i1), int(i2)), max(int(i1), int(i2)))
-        result = self.inv_edges.get(search, _MISSING_ID)
+        result = self._find(self.edges, i1, i2)
         if result == _MISSING_ID and not skip:
             raise MeshException(f"There is no edge with indices {i1}, {i2}")
         return result
@@ -240,9 +262,9 @@ class Mesh3D(Mesh, Saveable):
     def get_tri(self, i1, i2, i3) -> int:
         """Return the triangle index given the three node indices"""
         i11, i21, i31 = tuple(sorted((int(i1), int(i2), int(i3))))
-        output = self.inv_tris.get(tuple(sorted((int(i1), int(i2), int(i3)))), None)
-        if output is None:
-            DEBUG_COLLECTOR.add_report(
+        output = self._find(self.tris, i1, i2, i3)
+        if output == _MISSING_ID:
+            _GlobalHandler.active().debugcollector.add_report(
                 f"Mesh3D: The program is crashed due to a non existing triangle {i11}, {i21}, {i31}. This occurs often if surfaces stick out of the 3D domain.\n"
                 + "Only 3D volumes can be meshed. Parts or entire simulations that are two dimensional will cause this problem."
             )
@@ -253,10 +275,8 @@ class Mesh3D(Mesh, Saveable):
 
     def get_tet(self, i1, i2, i3, i4) -> int:
         """Return the tetrahedron index given the four node indices"""
-        output = self.inv_tets.get(
-            tuple(sorted((int(i1), int(i2), int(i3), int(i4)))), None
-        )
-        if output is None:
+        output = self._find(self.tets, i1, i2, i3, i4)
+        if output == _MISSING_ID:
             raise MeshException(
                 f"There is no tetrahedron with indices {i1}, {i2}, {i3}, {i4}"
             )
@@ -343,6 +363,17 @@ class Mesh3D(Mesh, Saveable):
         tettags = tettags[tettags != _MISSING_ID]
         return np.sort(tettags)
 
+    def _get_tet_to_tag(self) -> np.ndarray:
+        """Returns an array that counts which domain tag is assigned to each tetrahedron
+
+        Returns:
+            np.ndarray: _description_
+        """
+        tags = np.zeros((self.n_tets,), dtype=np.int64)
+        for tag, tets in self.vtag_to_tet.items():
+            tags[tets] = tag
+        return tags
+    
     def _get_dimtags(
         self, nodes: list[int] | None = None, edges: list[int] | None = None
     ) -> list[tuple[int, int]]:
@@ -401,19 +432,7 @@ class Mesh3D(Mesh, Saveable):
     def diagnose(self) -> None:
         """Executes a diagnosis for the mesh to make sure that it is properly defined."""
 
-        # Check 1: Make sure that all i2t bindings are complete
-        for i in range(self.n_nodes):
-            if i not in self.n_i2t:
-                raise MeshException(
-                    f"Node {i} is not referenced in the node-to-tet mapping. "
-                    f"This indicates an orphan node in the mesh."
-                )
-        for i in range(self.n_tets):
-            if i not in self.tet_i2t:
-                raise MeshException(
-                    f"Tetrahedron {i} is not referenced in the tet-to-tet mapping. "
-                    f"This indicates a disconnected element in the mesh."
-                )
+        # Every node and tet index has a GMSH tag by construction (they are enumerated from GMSH in _pre_update).
 
         # Check if the mesh is densely connected
         from scipy.sparse import csr_matrix
@@ -437,9 +456,9 @@ class Mesh3D(Mesh, Saveable):
         # Check tet-to-edge and tet-to-tri
         pointed_edges = np.zeros((self.n_edges,), dtype=np.bool_)
         pointed_tris = np.zeros((self.n_tris,), dtype=np.bool_)
-        for itet in range(self.n_tets):
-            pointed_edges[self.tet_to_edge[:, itet]] = True
-            pointed_tris[self.tet_to_tri[:, itet]] = True
+        pointed_tris[self.tet_to_tri] = True
+        pointed_edges[self.tet_to_edge] = True
+        
         if not np.all(pointed_edges):
             orphan_edges = np.where(~pointed_edges)[0]
             raise MeshException(
@@ -456,33 +475,24 @@ class Mesh3D(Mesh, Saveable):
             )
 
         # Compute volumes and areas
-        from .mth.optimized import calc_volume, calc_area
-
-        for i in range(self.n_tets):
-            i1, i2, i3, i4 = self.tets[:, i]
-            V = calc_volume(
-                self.nodes[:, i1],
-                self.nodes[:, i2],
-                self.nodes[:, i3],
-                self.nodes[:, i4],
+        zero_volume = np.flatnonzero(_tet_volumes(self.nodes, self.tets) == 0.0)
+        if zero_volume.size > 0:
+            i = int(zero_volume[0])
+            logger.error(
+                f"Zero volume tetrahedron at index {i}. This points to degenerate geometries."
             )
-            if V == 0.0:
-                logger.error(
-                    f"Zero volume tetrahedron at index {i}. This points to degenerate geometries."
-                )
-                raise MeshException(
-                    f"Zero volume tetrahedron at index {i}. This points to degenerate geometries."
-                )
-        for i in range(self.n_tris):
-            i1, i2, i3 = self.tris[:, i]
-            V = calc_area(self.nodes[:, i1], self.nodes[:, i2], self.nodes[:, i3])
-            if V == 0.0:
-                logger.error(
-                    f"Zero area triangle at index {i}. This points to degenerate geometries."
-                )
-                raise MeshException(
-                    f"Zero area triangle at index {i}. This points to degenerate geometries."
-                )
+            raise MeshException(
+                f"Zero volume tetrahedron at index {i}. This points to degenerate geometries."
+            )
+        zero_area = np.flatnonzero(_tri_areas(self.nodes, self.tris) == 0.0)
+        if zero_area.size > 0:
+            i = int(zero_area[0])
+            logger.error(
+                f"Zero area triangle at index {i}. This points to degenerate geometries."
+            )
+            raise MeshException(
+                f"Zero area triangle at index {i}. This points to degenerate geometries."
+            )
 
     def fix_zero_volumes(
         self, tol: float = 1e-25, perturbation: float = 1e-12, respect_boundaries=True
@@ -499,8 +509,6 @@ class Mesh3D(Mesh, Saveable):
         Raises:
             MeshException: If a degenerate tet has all four nodes on boundaries.
         """
-        from .mth.optimized import calc_volume
-
         # Collect all boundary-constrained nodes into a set for fast lookup
         boundary_nodes = set()
         for node_list in self.ftag_to_node.values():
@@ -508,15 +516,11 @@ class Mesh3D(Mesh, Saveable):
 
         n_fixed = 0
 
-        for itet in range(self.tets.shape[1]):
+        # Only tets that are degenerate up front can be degenerate; each is re-checked with the current nodes.
+        for itet in np.flatnonzero(_tet_volumes(self.nodes, self.tets) < tol):
+            itet = int(itet)
             i1, i2, i3, i4 = self.tets[:, itet]
-            v1, v2, v3, v4 = (
-                self.nodes[:, i1],
-                self.nodes[:, i2],
-                self.nodes[:, i3],
-                self.nodes[:, i4],
-            )
-            V = calc_volume(v1, v2, v3, v4)
+            V = _tet_volumes(self.nodes, self.tets[:, itet:itet + 1])[0]
 
             if V >= tol:
                 continue
@@ -561,13 +565,7 @@ class Mesh3D(Mesh, Saveable):
             n_fixed += 1
 
             # Verify it actually worked
-            v1, v2, v3, v4 = (
-                self.nodes[:, i1],
-                self.nodes[:, i2],
-                self.nodes[:, i3],
-                self.nodes[:, i4],
-            )
-            V_new = calc_volume(v1, v2, v3, v4)
+            V_new = _tet_volumes(self.nodes, self.tets[:, itet:itet + 1])[0]
             if V_new < tol:
                 logger.warning(
                     f"Tetrahedron {itet} still degenerate after perturbation (V={V_new}). "
@@ -582,7 +580,7 @@ class Mesh3D(Mesh, Saveable):
                 f"with magnitude {perturbation}."
             )
 
-    def _pre_update(self, periodic_bcs: list[Periodic] | None = None):
+    def _pre_update(self, periodic_bcs: list[Periodic] | None = None, scale: float = 1.0):
         """Builds the mesh data properties
 
         Args:
@@ -618,7 +616,7 @@ class Mesh3D(Mesh, Saveable):
             3: vol_dimtags,
         }
         _, edge_tags, edge_node_tags = gmsh.model.mesh.get_elements(1)
-        _, tri_tags, tri_node_tags = gmsh.model.mesh.get_elements(2)
+        _, _, tri_node_tags = gmsh.model.mesh.get_elements(2)
         _, tet_tags, tet_node_tags = gmsh.model.mesh.get_elements(3)
         _edge_entity_map = {
             t: gmsh.model.mesh.get_elements(1, t)[1]
@@ -641,9 +639,13 @@ class Mesh3D(Mesh, Saveable):
             self.dimtag_to_center.update(
                 {dt: gmsh.model.occ.get_center_of_mass(*dt) for dt in dts}
             )
+            
             self.dimtag_to_bb.update(
-                {dt: np.array(gmsh.model.occ.get_bounding_box(*dt)) for dt in dts}
+                {dt: np.array(gmsh.model.occ.get_bounding_box(*dt))*scale for dt in dts}
             )
+        if scale != 1.0:
+            self.dimtag_to_center = {dt: (x*scale, y*scale, z*scale) for dt, (x,y,z) in self.dimtag_to_center.items()}
+
 
         # -----------------------------------------------------------------------------
         # Start of Processing
@@ -653,8 +655,8 @@ class Mesh3D(Mesh, Saveable):
         # Vertices
         # -----------------------------------------------------------------------------
         self.nodes = lin_coords.reshape(-1, 3).T
-        self.n_i2t = {i: int(t) for i, t in enumerate(nodes)}
-        self.n_t2i = {t: i for i, t in self.n_i2t.items()}
+        # GMSH tag -> index mappings are local: nothing needs them once the mesh is built.
+        n_t2i = {t: i for i, t in enumerate(np.asarray(nodes, dtype=np.int64).tolist())}
 
         logger.trace(f"Total of {self.nodes.shape[1]} nodes imported.")
 
@@ -666,12 +668,9 @@ class Mesh3D(Mesh, Saveable):
         # Hence the use of tri_node_tags[0] in the next line. If domains are missing.
         # Make sure to combine all the entries in the tri-node-tags list
 
-        tet_node_tags = [self.n_t2i[int(t)] for t in tet_node_tags[0]]
-        tet_tags = np.squeeze(np.array(tet_tags))
+        tet_node_ids = _dict_lookup(n_t2i)(tet_node_tags[0])
 
-        self.tets = np.array(tet_node_tags).reshape(-1, 4).T
-        self.tet_i2t = {i: int(t) for i, t in enumerate(tet_tags)}
-        self.tet_t2i = {t: i for i, t in self.tet_i2t.items()}
+        self.tets = tet_node_ids.reshape(-1, 4).T
         self.centers = (
             self.nodes[:, self.tets[0, :]]
             + self.nodes[:, self.tets[1, :]]
@@ -692,44 +691,29 @@ class Mesh3D(Mesh, Saveable):
 
         for bc in periodic_bcs:
             logger.trace(f"reassigning ordered node numbers for periodic boundary {bc}")
-            nodemap, ids1, ids2 = self._pre_derive_node_map(bc)
+            nodemap, ids1, ids2 = self._pre_derive_node_map(bc, n_t2i)
             nodemap = {int(a): int(b) for a, b in nodemap.items()}
             self.nodes[:, ids2] = self.nodes[:, ids1]
-            for itet in range(self.tets.shape[1]):
-                self.tets[:, itet] = [nodemap.get(i, i) for i in self.tets[:, itet]]
-            self.n_t2i = {t: nodemap.get(i, i) for t, i in self.n_t2i.items()}
-            self.n_i2t = {t: i for i, t in self.n_t2i.items()}
+            node_lut = np.arange(self.nodes.shape[1], dtype=np.int64)
+            node_lut[np.fromiter(nodemap.keys(), dtype=np.int64, count=len(nodemap))] = np.fromiter(
+                nodemap.values(), dtype=np.int64, count=len(nodemap)
+            )
+            self.tets = node_lut[self.tets]
+            n_t2i = {t: nodemap.get(i, i) for t, i in n_t2i.items()}
 
         # -----------------------------------------------------------------------------
         # Extracting Edges and Triangles
         # -----------------------------------------------------------------------------
 
-        edgeset = set()
-        triset = set()
-
-        # As much as possible, the same loop is reused for as many properties.
         # EMerge uses the ordered numbering logic. Edges and triangles
         # can be hashed assuming that indices of their constituent vertices
-        # are always ordered, thus a triangle (10,5,1) is hashed as (1,5,10)
-        for itet in range(self.tets.shape[1]):
-            i1, i2, i3, i4 = sorted([int(ind) for ind in self.tets[:, itet]])
-            edgeset.add((i1, i2))
-            edgeset.add((i1, i3))
-            edgeset.add((i1, i4))
-            edgeset.add((i2, i3))
-            edgeset.add((i2, i4))
-            edgeset.add((i3, i4))
-            triset.add((i1, i2, i3))
-            triset.add((i1, i2, i4))
-            triset.add((i1, i3, i4))
-            triset.add((i2, i3, i4))
+        # are always ordered, thus a triangle (10,5,1) is hashed as (1,5,10).
+        # Both are returned sorted lexicographically.
+        self.edges, self.tris = _emr_mesh.extract_edges_tris(self.tets)
 
         logger.trace(
-            f"Total of {len(edgeset)} unique edges and {len(triset)} unique triangles."
+            f"Total of {self.edges.shape[1]} unique edges and {self.tris.shape[1]} unique triangles."
         )
-
-        self.edges = np.array(sorted(list(edgeset))).T
-        self.tris = np.array(sorted(list(triset))).T
 
         # -----------------------------------------------------------------------------
         # Creating inverse mappings from edge/tri/tet id-tuples to integers
@@ -747,31 +731,12 @@ class Mesh3D(Mesh, Saveable):
         _sorted_tris = np.sort(self.tris, axis=0)
         _sorted_tets = np.sort(self.tets, axis=0)
 
-        self.inv_edges = {tuple(_sorted_edges[:, i].tolist()): i for i in range(nE)}
-        self.inv_tris = {tuple(_sorted_tris[:, i].tolist()): i for i in range(nR)}
-        self.inv_tets = {tuple(_sorted_tets[:, i].tolist()): i for i in range(nT)}
-
         # -----------------------------------------------------------------------------
         # Constructucting Tet -> Edge/Tri mapping
         # -----------------------------------------------------------------------------
-        self.tet_to_edge = np.zeros((6, self.tets.shape[1]), dtype=int) + _MISSING_ID
-        self.tet_to_tri = np.zeros((4, self.tets.shape[1]), dtype=int) + _MISSING_ID
-
-        _idset1 = ((1, 2), (1, 3), (1, 4), (2, 3), (4, 2), (3, 4))
-        _idset2 = ((1, 2, 3), (1, 3, 4), (1, 4, 2), (2, 3, 4))
-
-        for itet in range(self.tets.shape[1]):
-            t = self.tets[:, itet]
-            self.tet_to_edge[:, itet] = [
-                self.inv_edges[tuple(sorted((int(t[i - 1]), int(t[j - 1]))))]
-                for i, j in _idset1
-            ]
-            self.tet_to_tri[:, itet] = [
-                self.inv_tris[
-                    tuple(sorted((int(t[i - 1]), int(t[j - 1]), int(t[k - 1]))))
-                ]
-                for i, j, k in _idset2
-            ]
+        # Local edge order: (1,2), (1,3), (1,4), (2,3), (4,2), (3,4)
+        # Local triangle order: (1,2,3), (1,3,4), (1,4,2), (2,3,4)
+        self.tet_to_edge, self.tet_to_tri = _emr_mesh.tet_to_edge_tri(self.tets, self.edges, self.tris)
 
         # -----------------------------------------------------------------------------
         # Constructing Tri -> Tet mapping
@@ -805,83 +770,45 @@ class Mesh3D(Mesh, Saveable):
 
         # tri tags are all labels for all triangular elements in the Mesh
 
-        tri_tags = np.array(tri_tags[0], dtype=int)
-        tri_nodes = np.array(
-            [self.n_t2i[int(t)] for t in tri_node_tags[0]], dtype=int
-        ).reshape(-1, 3)
+        n_t2i_lookup = _dict_lookup(n_t2i)
+        tri_nodes = n_t2i_lookup(tri_node_tags[0]).reshape(-1, 3)
 
-        self.tri_i2t = {}
-        _sorted_tri_nodes = np.sort(tri_nodes, axis=1)
-
+        tri_ids = _emr_mesh.find_columns(_sorted_tris, tri_nodes.T)
         try:
-            for k, tag in enumerate(tri_tags):
-                tri_id = self.inv_tris[tuple(_sorted_tri_nodes[k, :].tolist())]
-                self.tri_i2t[tri_id] = int(tag)
+            missing = np.flatnonzero(tri_ids == _MISSING_ID)
+            if missing.size > 0:
+                raise KeyError(tuple(np.sort(tri_nodes[missing[0], :]).tolist()))
         except KeyError as e:
             logger.error(e)
-            DEBUG_COLLECTOR.add_report(
+            _GlobalHandler.active().debugcollector.add_report(
                 "A missing key error usually indicates that there are flat geometries sticking out of the simulation domain.\nEMerge can only deal with volumetric data. Please check the geometry using .view(use_gmsh=True) before meshing to make sure no surfaces are sticking out of the domain."
             )
             raise e
-        self.tri_t2i = {t: i for i, t in self.tri_i2t.items()}
 
         # -----------------------------------------------------------------------------
         # Triangle -> Edge and Edge -> Tri
         # -----------------------------------------------------------------------------
 
-        _edge_lookup_mat = np.full((nN, nN), _MISSING_ID, dtype=np.int32)
-        _edge_lookup_mat[self.edges[0], self.edges[1]] = np.arange(nE)
-        _edge_lookup_mat[self.edges[1], self.edges[0]] = np.arange(nE)
+        _edge_keys = (
+            np.minimum(self.edges[0], self.edges[1]).astype(np.int64) * nN
+            + np.maximum(self.edges[0], self.edges[1])
+        )
+        _key_order = np.argsort(_edge_keys, kind="stable")
+        _sorted_keys = _edge_keys[_key_order]
+        _sorted_edge_ids = _key_order  # edge id at each position in the sorted key array
+
+        def _lookup_edge(a, b):
+            """Vectorized replacement for _edge_lookup_mat[a, b]."""
+            key = np.minimum(a, b).astype(np.int64) * nN + np.maximum(a, b)
+            pos = np.searchsorted(_sorted_keys, key)
+            pos = np.clip(pos, 0, len(_sorted_keys) - 1)
+            found = _sorted_keys[pos] == key
+            return np.where(found, _sorted_edge_ids[pos], _MISSING_ID)
 
         self.tri_to_edge = np.zeros((3, self.tris.shape[1]), dtype=int)
-        self.tri_to_edge[0] = _edge_lookup_mat[_sorted_tris[0], _sorted_tris[1]]
-        self.tri_to_edge[1] = _edge_lookup_mat[_sorted_tris[1], _sorted_tris[2]]
-        self.tri_to_edge[2] = _edge_lookup_mat[_sorted_tris[0], _sorted_tris[2]]
-
-        # This algorithm is optimized with help of Claude code.
-        # Because each edge may be part of multiple triangles, an efficient algorithm
-        # using numpy optimized functions is needed
-
-        flat_edges = self.tri_to_edge.ravel(order="F")
-        flat_tris = np.repeat(np.arange(nR, dtype=int), 3)
-        sort_idx = np.argsort(flat_edges, stable=True)
-        sorted_edges = flat_edges[sort_idx]
-        sorted_tris_e = flat_tris[sort_idx]
-        _, first_idx, counts = np.unique(
-            sorted_edges, return_index=True, return_counts=True
-        )
-        max_count = int(counts.max())
-        self.edge_to_tri = np.full((max_count, nE), _MISSING_ID, dtype=int)
-        for k in range(max_count):
-            mask = counts > k
-            self.edge_to_tri[k, sorted_edges[first_idx[mask]]] = sorted_tris_e[
-                first_idx[mask] + k
-            ]
-
-        # -----------------------------------------------------------------------------
-        # Node to Edge mapping
-        # -----------------------------------------------------------------------------
-
-        flat_nodes = self.edges.ravel(order="F")
-        flat_edges = np.repeat(np.arange(self.edges.shape[1], dtype=int), 2)
-
-        sort_idx = np.argsort(flat_nodes, stable=True)
-        sorted_nodes = flat_nodes[sort_idx]
-        sorted_edges = flat_edges[sort_idx]
-
-        _, first_idx, counts = np.unique(
-            sorted_nodes, return_index=True, return_counts=True
-        )
-        max_count = int(counts.max())
-
-        self.node_to_edge = np.full(
-            (max_count, self.nodes.shape[1]), _MISSING_ID, dtype=int
-        )
-        for k in range(max_count):
-            mask = counts > k
-            self.node_to_edge[k, sorted_nodes[first_idx[mask]]] = sorted_edges[
-                first_idx[mask] + k
-            ]
+        self.tri_to_edge[0] = _lookup_edge(_sorted_tris[0], _sorted_tris[1])
+        self.tri_to_edge[1] = _lookup_edge(_sorted_tris[1], _sorted_tris[2])
+        self.tri_to_edge[2] = _lookup_edge(_sorted_tris[0], _sorted_tris[2])
 
         # -----------------------------------------------------------------------------
         # Mesh Quantities
@@ -928,16 +855,16 @@ class Mesh3D(Mesh, Saveable):
         edge_tags = np.array(edge_tags).flatten()
         ent = np.array(edge_node_tags).reshape(-1, 2).T
         nET = ent.shape[1]
-        self.edge_t2i = {
-            int(edge_tags[i]): self.get_edge(
-                self.n_t2i[ent[0, i]], self.n_t2i[ent[1, i]], skip=True
+        ent_ids = n_t2i_lookup(ent.reshape(-1)).reshape(2, nET)
+        if np.any(ent_ids[0] == ent_ids[1]):
+            raise MeshException("Edge cannot be formed by the same node.")
+        edge_t2i = dict(
+            zip(
+                edge_tags.astype(np.int64).tolist(),
+                _emr_mesh.find_columns(self.edges, ent_ids).tolist(),
             )
-            for i in range(nET)
-        }
-        self.edge_t2i = {
-            key: value for key, value in self.edge_t2i.items() if value != -_MISSING_ID
-        }
-        self.edge_i2t = {i: t for t, i in self.edge_t2i.items()}
+        )
+        edge_t2i = {key: value for key, value in edge_t2i.items() if value != _MISSING_ID}
 
         # -----------------------------------------------------------------------------
         # OpenCASCADE Domain to Mesh mappings
@@ -953,9 +880,9 @@ class Mesh3D(Mesh, Saveable):
                 self.etag_to_edge[t] = []
                 continue
             self.etag_to_edge[t] = [
-                int(self.edge_t2i.get(tag, None))
+                int(edge_t2i[tag])
                 for tag in _edge_tags[0]
-                if tag in self.edge_t2i
+                if tag in edge_t2i
             ]
             self.geonodes.extend([int(i) for i in _edge_entity_map_2[t][0]])
 
@@ -967,15 +894,21 @@ class Mesh3D(Mesh, Saveable):
         # -----------------------------------------------------------------------------
         logger.trace("Constructing geometry to mesh mappings.")
 
+        face_node_ids = {t: n_t2i_lookup(_face_entity_map[t][0]) for _d, t in face_dimtags}
+        face_tri_ids = _emr_mesh.find_columns(
+            _sorted_tris,
+            np.concatenate([np.zeros(0, dtype=np.int64), *face_node_ids.values()]).reshape(-1, 3).T,
+        )
+        face_offset = 0
         for _d, t in face_dimtags:
-            node_tags = _face_entity_map[t]
-            node_tags = [self.n_t2i[int(t)] for t in node_tags[0]]
-            self.ftag_to_node[t] = node_tags
-            node_tags = np.squeeze(np.array(node_tags)).reshape(-1, 3).T
-            self.ftag_to_tri[t] = [
-                self.get_tri(node_tags[0, i], node_tags[1, i], node_tags[2, i])
-                for i in range(node_tags.shape[1])
-            ]
+            node_ids = face_node_ids[t]
+            tri_ids = face_tri_ids[face_offset:face_offset + node_ids.shape[0] // 3]
+            face_offset += node_ids.shape[0] // 3
+            missing = np.flatnonzero(tri_ids == _MISSING_ID)
+            if missing.size > 0:
+                # Raises the MeshException with the standard diagnostic report
+                self.get_tri(*node_ids.reshape(-1, 3)[missing[0], :])
+            self.ftag_to_tri[t] = tri_ids.tolist()
             self.ftag_to_edge[t] = sorted(
                 list(np.unique(self.tri_to_edge[:, self.ftag_to_tri[t]].flatten()))
             )
@@ -985,13 +918,19 @@ class Mesh3D(Mesh, Saveable):
         # Geometry Volume to Tetrahedra mapping
         # -----------------------------------------------------------------------------
 
+        vol_node_ids = {t: n_t2i_lookup(_vol_entity_map[t][0]).reshape(-1, 4) for _d, t in vol_dimtags}
+        vol_tet_ids = _emr_mesh.find_columns(
+            _sorted_tets,
+            np.concatenate([np.zeros((0, 4), dtype=np.int64), *vol_node_ids.values()]).T,
+        )
+        vol_offset = 0
         for _d, t in vol_dimtags:
-            node_tags = _map_array_by_dict(_vol_entity_map[t][0], self.n_t2i)
-            node_tags = node_tags.reshape(-1, 4)
-            sorted_nodes = np.sort(node_tags, axis=1)
-            self.vtag_to_tet[t] = [
-                self.inv_tets[tuple(row)] for row in sorted_nodes.tolist()
-            ]
+            tet_ids = vol_tet_ids[vol_offset:vol_offset + vol_node_ids[t].shape[0]]
+            vol_offset += vol_node_ids[t].shape[0]
+            missing = np.flatnonzero(tet_ids == _MISSING_ID)
+            if missing.size > 0:
+                raise KeyError(tuple(np.sort(vol_node_ids[t][missing[0], :]).tolist()))
+            self.vtag_to_tet[t] = tet_ids.tolist()
         self.defined = True
 
         # -----------------------------------------------------------------------------
@@ -1006,21 +945,21 @@ class Mesh3D(Mesh, Saveable):
                 self.dimtag_to_edges[dt] = self._domain_edge(dt)
                 self.dimtag_to_nodes[dt] = np.array(
                     [
-                        self.n_t2i[gmsh.model.mesh.get_nodes(*dt)[0][0]]
+                        n_t2i[gmsh.model.mesh.get_nodes(*dt)[0][0]]
                         for dt in gmsh.model.get_boundary([dt], True, False, True)
                     ]
                 )
                 if dim == 2:
-                    center = self.dimtag_to_center[dt]
-                    xyz, _ = gmsh.model.get_closest_point(*dt, center)
-                    self.ftag_to_point[dt[1]] = np.array(xyz)
+                    (x0,y0,z0) = self.dimtag_to_center[dt]
+                    xyz, _ = gmsh.model.get_closest_point(*dt, (x0/scale, y0/scale, z0/scale))
+                    self.ftag_to_point[dt[1]] = np.array(xyz)*scale
 
         logger.info("Finalized mesh data generation!")
 
     ## Higher order functions
 
     def _pre_derive_node_map(
-        self, bc: Periodic
+        self, bc: Periodic, n_t2i: dict[int, int]
     ) -> tuple[dict[int, int], np.ndarray, np.ndarray]:
         """Computes an old to new node index mapping that preserves global sorting
 
@@ -1031,6 +970,7 @@ class Mesh3D(Mesh, Saveable):
 
         Args:
             bc (Periodic): The Periodic boundary condition
+            n_t2i (dict[int, int]): GMSH node tag to node index
 
         Returns:
             tuple[dict[int, int], np.ndarray, np.ndarray]: The node index mapping and the node index arrays
@@ -1045,7 +985,7 @@ class Mesh3D(Mesh, Saveable):
 
         for d, t in face_dimtags:
             domain_tag, f_tags, node_tags = gmsh.model.mesh.get_elements(2, t)
-            node_tags = [self.n_t2i[int(t)] for t in node_tags[0]]
+            node_tags = [n_t2i[int(t)] for t in node_tags[0]]
             if t in bc.face1.tags:
                 node_ids_1.extend(node_tags)
             if t in bc.face2.tags:
@@ -1143,6 +1083,7 @@ class Mesh3D(Mesh, Saveable):
         self,
         tri_ids: list[int],
         alignment_origin: tuple[float, float, float] | None = None,
+        consistent: bool = False,
     ) -> np.ndarray:
         """Computes strictly outward facing normals for given triangle indices.
 
@@ -1154,6 +1095,9 @@ class Mesh3D(Mesh, Saveable):
         Args:
             tri_ids (list[int]): _description_
             alignment_origin (tuple[float, float, float], optional): A normal alignment origin in case inside vs. outside is not apparant.
+            consistent (bool, optional): Orient the normals consistently over the connected surface instead of per
+                triangle, see `_orient_surface`. Needed for surfaces inside the mesh such as a PML interface,
+                where a triangle has a tetrahedron on both sides. Defaults to False.
 
         Returns:
             np.ndarray: _description_
@@ -1178,6 +1122,9 @@ class Mesh3D(Mesh, Saveable):
         signflip = np.sign(np.sum(align * normals, axis=0))
         normals = signflip * normals
 
+        if consistent:
+            normals = self._orient_surface(np.asarray(tri_ids), normals)
+
         if alignment_origin is not None:
             rad_vec = tri_centers.copy()
             rad_vec[0, :] -= alignment_origin[0]
@@ -1187,11 +1134,89 @@ class Mesh3D(Mesh, Saveable):
             normals = normals * signflip
         return normals
 
+    # [Written by Claude]
+    def _orient_surface(self, tri_ids: np.ndarray, normals: np.ndarray) -> np.ndarray:
+        """Flips normals so they are consistent over each connected part of the surface and point outward.
+
+        The per triangle rule of `outward_normals` points away from the adjacent tetrahedron, which is only defined
+        on the domain boundary. A triangle inside the mesh (e.g. an air/PML interface) has a tetrahedron on both
+        sides and gets an arbitrary side. Here neighbouring triangles (sharing an edge with no third triangle) are
+        made to agree, then each connected part gets one sign: that of the majority of its domain boundary
+        triangles if it has any, otherwise the sign that gives a positive enclosed volume (outward on a closed surface).
+
+        Args:
+            tri_ids (np.ndarray): The triangle indices (N,)
+            normals (np.ndarray): The unit normals (3, N) of those triangles
+
+        Returns:
+            np.ndarray: The oriented normals (3, N)
+        """
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components, breadth_first_order
+
+        N = tri_ids.size
+        if N < 2:
+            return normals
+        tris = self.tris[:, tri_ids]
+        p0, p1, p2 = (self.nodes[:, tris[i]] for i in range(3))
+        cross = np.cross((p1 - p0).T, (p2 - p0).T).T
+        # +1 where the normal follows the node order of the triangle
+        follows = np.sign(np.sum(cross * normals, axis=0))
+        follows[follows == 0] = 1
+
+        # Directed edges a->b of every triangle, keyed by the sorted node pair
+        a = tris.ravel()
+        b = tris[[1, 2, 0], :].ravel()
+        owner = np.tile(np.arange(N), 3)
+        direction = np.where(a < b, 1, -1)
+        key = np.minimum(a, b).astype(np.int64) * (self.nodes.shape[1] + 1) + np.maximum(a, b)
+        order = np.argsort(key, kind="stable")
+        key, owner, direction = key[order], owner[order], direction[order]
+        _, start, count = np.unique(key, return_index=True, return_counts=True)
+        pair = start[count == 2]  # manifold edges only
+        t1, t2 = owner[pair], owner[pair + 1]
+        # Consistent when the two triangles walk the shared edge in opposite directions: then the relative
+        # orientation of the vertex-order normals is -d1*d2
+        rel = -direction[pair] * direction[pair + 1]
+
+        graph = coo_matrix((rel + 2, (t1, t2)), shape=(N, N)).tocsr()
+        graph = (graph + coo_matrix((rel + 2, (t2, t1)), shape=(N, N)).tocsr()).tocsr()
+        ncomp, labels = connected_components(graph, directed=False)
+
+        # orient[i] = +1 keeps the vertex-order normal of triangle i, -1 flips it
+        orient = np.zeros(N, dtype=int)
+        for comp in range(ncomp):
+            root = np.flatnonzero(labels == comp)[0]
+            visit, pred = breadth_first_order(graph, root, directed=False, return_predecessors=True)
+            orient[root] = follows[root]
+            for i in visit[1:]:
+                orient[i] = orient[pred[i]] * (int(graph[pred[i], i]) - 2)
+
+        unit = cross / np.linalg.norm(cross, axis=0)
+        oriented = unit * orient
+
+        on_boundary = (self.tri_to_tet[1, tri_ids] == _MISSING_ID) | (self.tri_to_tet[0, tri_ids] == _MISSING_ID)
+        areas = 0.5 * np.linalg.norm(cross, axis=0)
+        centers = self.tri_centers[:, tri_ids]
+        for comp in range(ncomp):
+            sel = labels == comp
+            ref = sel & on_boundary
+            if ref.any():
+                agree = np.sum(np.sum(oriented[:, ref] * normals[:, ref], axis=0) * areas[ref])
+                sign = 1 if agree >= 0 else -1
+            else:
+                c0 = centers[:, sel].mean(axis=1, keepdims=True)
+                volume = np.sum(np.sum((centers[:, sel] - c0) * oriented[:, sel], axis=0) * areas[sel])
+                sign = 1 if volume >= 0 else -1
+            oriented[:, sel] *= sign
+        return oriented
+
     def boundary_surface(
         self,
         face_tags: Union[int, list[int]],
         inward_normal: bool = True,
         origin: tuple[float, float, float] | None = None,
+        consistent: bool = False,
     ) -> SurfaceMesh:
         """Returns a SurfaceMesh class that is a 2D mesh isolated from the 3D mesh
 
@@ -1203,13 +1228,15 @@ class Mesh3D(Mesh, Saveable):
         Args:
             face_tags (Union[int, list[int]]): The list of face tags to use
             origin (tuple[float, float, float], optional): The normal vecor alignment origin. Defaults to None.
+            consistent (bool, optional): Orient the normals consistently over the surface, see `outward_normals`.
+                Defaults to False.
 
         Returns:
             SurfaceMesh: The resultant surface mesh
         """
         tri_ids = self.get_triangles(face_tags)
 
-        normals = self.outward_normals(tri_ids, alignment_origin=origin)
+        normals = self.outward_normals(tri_ids, alignment_origin=origin, consistent=consistent)
         if inward_normal:
             normals = -normals
 
@@ -1239,15 +1266,24 @@ class Mesh3D(Mesh, Saveable):
         norm = np.linalg.norm(normal)
         return normal / norm
 
-    def inward_normal(self, face_tags: list[int]) -> np.ndarray:
-        """Compute the inward pointing normal vector and return it."""
+    def inward_normal(self, face_tags: list[int], exclude_tets: np.ndarray | None = None) -> np.ndarray:
+        """Compute the inward pointing normal vector of a (planar) face and return it.
+
+        Args:
+            face_tags (list[int]): The face tags.
+            exclude_tets (np.ndarray | None, optional): Boolean mask (n_tets,) of tetrahedra that do not count as
+                the inside, e.g. void domains. The normal then points into the other adjacent tetrahedron. Defaults to None.
+        """
         tri_ids = self.get_triangles(face_tags)
 
         tri_ids = np.array(sorted(list(set(tri_ids))))
 
         tri1 = tri_ids[0]
         tri_center = self.tri_centers[:, tri1]
-        tet_center = self.centers[:, self.tri_to_tet[0, tri1]]
+        itet = self.tri_to_tet[0, tri1]
+        if exclude_tets is not None and exclude_tets[itet] and self.tri_to_tet[1, tri1] != _MISSING_ID:
+            itet = self.tri_to_tet[1, tri1]
+        tet_center = self.centers[:, itet]
 
         inside = tet_center - tri_center
         port_normal = self.get_normal(tri1)
@@ -1259,7 +1295,7 @@ class Mesh3D(Mesh, Saveable):
         return port_normal
 
 
-class SurfaceMesh(Mesh):
+class SurfaceMesh(Mesh, Saveable):
     """The surface mesh class is used to assemble the Modal port matrix.
 
 
@@ -1392,8 +1428,6 @@ class SurfaceMesh(Mesh):
     def update(self) -> None:
         ## First Edges
 
-        from .mth.optimized import area
-
         edges = set()
         for i in range(self.n_tris):
             i1, i2, i3 = self.tris[:, i]
@@ -1423,20 +1457,17 @@ class SurfaceMesh(Mesh):
             for i in range(self.tris.shape[1])
         }
         ##
-        self.areas = np.array(
-            [
-                area(
-                    self.nodes[:, self.tris[0, i]],
-                    self.nodes[:, self.tris[1, i]],
-                    self.nodes[:, self.tris[2, i]],
-                )
-                for i in range(self.n_tris)
-            ]
-        ).T
-
+        # TRIANGLE AREAS
         n1 = self.nodes[:, self.tris[0, :]]
         n2 = self.nodes[:, self.tris[1, :]]
         n3 = self.nodes[:, self.tris[2, :]]
+
+        e1 = n2 - n1
+        e2 = n3 - n1
+        av1 = e1[1, :] * e2[2, :] - e1[2, :] * e2[1, :]
+        av2 = e1[2, :] * e2[0, :] - e1[0, :] * e2[2, :]
+        av3 = e1[0, :] * e2[1, :] - e1[1, :] * e2[0, :]
+        self.areas = np.sqrt(av1**2 + av2**2 + av3**2) / 2
 
         self.centroids = 1 / 3 * (n1 + n2 + n3)
         self.tri_to_edge = np.ndarray((3, self.tris.shape[1]), dtype=int)

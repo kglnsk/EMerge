@@ -16,7 +16,7 @@ mil = 0.0254 * mm  # meter per mil (thousandth of an inch)
 W = 20.0  # reference trace width (mil)
 D = 20.0  # trace separation (mil)
 w0 = 37.0  # input/output line width (mil)
-l0 = 100.0  # input/output line length (mil)
+l0 = 400.0  # input/output line length (mil)
 l1 = 314.22  # coupled section total length (mil)
 l2 = 301.658  # inner coupled section length (mil)
 l3 = 300.589  # outer coupled section length (mil)
@@ -40,13 +40,13 @@ extra = 100  # extra margin (mil)
 
 # --- Simulation setup ----------------------------------------------------
 model = em.Simulation("CoupledLineFilter")
-model.check_version("2.8.0")  # Checks version compatibility.
+model.check_version("3.0.8")  # Checks version compatibility.
 
 # --- Material and layouter -----------------------------------------------
 mat = em.Material(er=3.55, color="#488343", opacity=0.4)
 
 # Create PCB layouter with given substrate thickness and units
-pcb = em.geo.PCBNew(th, unit=mil, material=mat)
+pcb = em.geo.PCB(th, unit=mil, material=mat, thick_traces=True, trace_thickness=35e-6)
 
 # --- Route coupled-line trace --------------------------------------------
 # start at (0,140) with width w0
@@ -74,9 +74,10 @@ pcb.determine_bounds(topmargin=150, bottommargin=150)
 # --- Generate dielectric and air blocks ----------------------------------
 diel = pcb.generate_pcb()  # substrate dielectric block
 air = pcb.generate_air(4 * th)  # surrounding air box
+
 # --- Define ports for simulation ----------------------------------------
-p1 = pcb.modal_port(pcb["p1"], width_multiplier=5, height=4 * th)
-p2 = pcb.modal_port(pcb["p2"], width_multiplier=5, height=4 * th)
+p1 = pcb.modal_port(pcb["p1"], 1, width_multiplier=5, height=4 * th, assume_homogeneous=True)
+p2 = pcb.modal_port(pcb["p2"], 2, width_multiplier=5, height=4 * th, assume_homogeneous=True)
 
 # --- Solver settings -----------------------------------------------------
 model.mw.set_resolution(0.2)  # mesh density: fraction of wavelength
@@ -84,23 +85,22 @@ model.mw.set_frequency_range(5.2e9, 6.2e9, 30)  # 5.2–6.2 GHz, 31 points
 
 # --- Assemble geometry into simulation -----------------------------------
 model.commit_geometry()
+
 # --- Mesh refinement -----------------------------------------------------
 # High growth rates are generally not adviced but used here to save some memory.
-model.mesher.set_boundary_size(stripline, 2 * mm, growth_rate=10)
-
+model.mesher.set_boundary_size(stripline, 1.0 * mm, growth_rate=4)
 model.mesher.set_face_size(p1, 1 * mm)
 model.mesher.set_face_size(p2, 1 * mm)
 
 # --- Mesh generation and view --------------------------------------------
 model.generate_mesh()  # build mesh
-model.view()
-
-# --- Boundary conditions ------------------------------------------------
-port1 = model.mw.bc.ModalPort(p1, 1, modetype="TEM")
-port2 = model.mw.bc.ModalPort(p2, 2, modetype="TEM")
+model.view(plot_mesh=True, volume_mesh=False)
 
 # --- Run frequency-domain solver ----------------------------------------
-data = model.mw.run_sweep()
+model.view(plot_mesh=True)
+
+
+data = model.mw.run_sweep(frequency_groups=2)
 
 # --- Extract and plot S-parameters ---------------------------------------
 f = data.scalar.grid.freq  # frequency axis
@@ -117,13 +117,16 @@ plot_sp(f_fit, [S11_fit, S21_fit], labels=["S11", "S21"])
 # --- 3D field visualization ------------------------------------------------
 
 field = data.field.find(freq=5.7e9)
-model.display.add_portmode(port1, k0=field.k0)
-model.display.add_portmode(port2, k0=field.k0)
+model.display.add_portmode(model.mw.bc.get_port(1), k0=field.k0)
+model.display.add_portmode(model.mw.bc.get_port(2), k0=field.k0)
 model.display.add_object(diel)
 model.display.add_object(stripline)
 model.display.animate().add_field(
     field.cutplane(0.5 * mm, z=-0.5 * th * mil).scalar("Ez", "complex"),
     symmetrize=True,
     clim_crop_factor=0.6,
+)
+model.display.animate().add_field(
+    field.current_boundary(model.mw.conducting_surfaces().below(1*mm)).scalar("Jsmag","complex"), cmap='classic'
 )
 model.display.show()
