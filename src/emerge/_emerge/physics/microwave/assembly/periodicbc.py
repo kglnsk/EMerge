@@ -16,7 +16,7 @@
 # <https://www.gnu.org/licenses/>.
 
 
-# Last Cleanup: 2025-01-01
+# Last Cleanup: 2026-10-10
 import numpy as np
 from numba import njit, types, i8, c16
 from scipy.sparse import csr_matrix
@@ -44,48 +44,42 @@ def _fill_periodic_matrix(tris: np.ndarray, edges: np.ndarray, tri_to_field: np.
     """
 
     # NUMBERS
-    N = tris.shape[1] + edges.shape[1]
     NT = tris.shape[1]
+    NE = edges.shape[1]
+    nedof = edge_to_field.shape[0]
+    face_start = 3 * nedof
+    nfdof = tri_to_field.shape[0] - face_start
+    N = NT * nfdof + NE * nedof
     
     DIAGONAL = np.ones((Nfield,), dtype=np.complex128)
-    ROWS = np.zeros((N*2,), dtype=np.int64)
-    COLS = np.zeros((N*2,), dtype=np.int64)
-    TERMS = np.zeros((N*2,), dtype=np.complex128)
+    ROWS = np.zeros((N,), dtype=np.int64)
+    COLS = np.zeros((N,), dtype=np.int64)
+    TERMS = np.ones((N,), dtype=np.complex128)
     
     i = 0
     for it in range(NT):
         t1 = tris[0,it]
         t2 = tris[1,it]
-        f11 = tri_to_field[3, t1]
-        f21 = tri_to_field[7, t1]
-        f12 = tri_to_field[3, t2]
-        f22 = tri_to_field[7, t2]
-        DIAGONAL[f12] = 0.
-        DIAGONAL[f22] = 0.
-        ROWS[i] = f12
-        ROWS[i+1] = f22
-        COLS[i] = f11
-        COLS[i+1] = f21
-        TERMS[i] = 1.0
-        TERMS[i+1] = 1.0
-        i += 2
-    NE = edges.shape[1]
+        # Nedelec2 stores three edges per edge basis, followed by ALL face
+        # bases. The old rows 3/7 selected an edge and omitted the first face
+        # basis in the mixed space, and accessed outside first-order arrays.
+        for dof in range(nfdof):
+            source = tri_to_field[face_start + dof, t1]
+            target = tri_to_field[face_start + dof, t2]
+            DIAGONAL[target] = 0.
+            ROWS[i] = target
+            COLS[i] = source
+            i += 1
     for ie in range(NE):
         e1 = edges[0,ie]
         e2 = edges[1,ie]
-        f11 = edge_to_field[0, e1]
-        f21 = edge_to_field[1, e1]
-        f12 = edge_to_field[0, e2]
-        f22 = edge_to_field[1, e2]
-        DIAGONAL[f12] = 0.
-        DIAGONAL[f22] = 0.
-        ROWS[i] = f12
-        ROWS[i+1] = f22
-        COLS[i] = f11
-        COLS[i+1] = f21
-        TERMS[i] = 1.0
-        TERMS[i+1] = 1.0
-        i += 2
+        for dof in range(nedof):
+            source = edge_to_field[dof, e1]
+            target = edge_to_field[dof, e2]
+            DIAGONAL[target] = 0.
+            ROWS[i] = target
+            COLS[i] = source
+            i += 1
     ROWS = ROWS[:i]
     COLS = COLS[:i]
     TERMS = TERMS[:i]
@@ -120,8 +114,15 @@ def gen_periodic_matrix(tris: np.ndarray,
         tuple[csr_matrix, np.ndarray]: _description_
     """
 
-    tris_array = np.array([(tri, linked_tris[tri]) for tri in tris]).T
-    edges_array = np.array([(edge, linked_edges[edge]) for edge in edges]).T
+    if edge_to_field.ndim != 2 or tri_to_field.ndim != 2:
+        raise ValueError("Periodic field mappings must be two-dimensional")
+    if tri_to_field.shape[0] < 3 * edge_to_field.shape[0]:
+        raise ValueError("Triangle mapping must contain three edges per edge basis")
+    for mapping in (edge_to_field, tri_to_field):
+        if mapping.size and (mapping.min() < 0 or mapping.max() >= Nfield):
+            raise ValueError("Periodic mapping contains an invalid field index")
+    tris_array = np.asarray([(tri, linked_tris[tri]) for tri in tris], dtype=np.int64).reshape(-1, 2).T
+    edges_array = np.asarray([(edge, linked_edges[edge]) for edge in edges], dtype=np.int64).reshape(-1, 2).T
     ROWS, COLS, TERMS, diagonal = _fill_periodic_matrix(tris_array, edges_array, tri_to_field, edge_to_field, Nfield)
     matrix = csr_matrix((TERMS, (ROWS, COLS)), [Nfield, Nfield], dtype=np.complex128)
     matrix.data.fill(phi)

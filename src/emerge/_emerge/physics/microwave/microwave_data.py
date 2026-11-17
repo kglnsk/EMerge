@@ -539,9 +539,9 @@ class MWField(Saveable):
         if self._mode_field is not None:
             return self._mode_field
         
-        if not isinstance(self._Texcite, np.ndarray):
-            self._Texcite = np.eye(len(self.port_modes), dtype=np.complex128)
         if len(self.port_modes) > 0:
+            if not isinstance(self._Texcite, np.ndarray):
+                self._Texcite = np.eye(len(self.port_modes), dtype=np.complex128)
             avec = np.array([self.excitation[i.smat_index] for i in self.port_modes])
             avec = self._Texcite @ avec
             return sum(
@@ -552,12 +552,20 @@ class MWField(Saveable):
             )  # type: ignore
 
         elif len(self.background_fields) > 0:
-            avec = np.array([self.excitation[i] for i in self.port_modes])
+            # Scattered-field runs have no port modes: the excitation vector is
+            # indexed by the BackgroundField objects themselves, which is also
+            # how .excitation and ._fields are keyed for this solve type
+            # (see set_excitation / the background_fields branch below).
+            if not isinstance(self._Texcite, np.ndarray):
+                self._Texcite = np.eye(
+                    len(self.background_fields), dtype=np.complex128
+                )
+            avec = np.array([self.excitation[f] for f in self.background_fields])
             avec = self._Texcite @ avec
             return sum(
                 [
                     avec[i] * self._fields[mode]
-                    for i,mode in enumerate(self.background_fields)
+                    for i, mode in enumerate(self.background_fields)
                 ]
             )
 
